@@ -1,0 +1,549 @@
+================================================================================
+AI-DOC INTERACT — SETUP, RUN, AND BASIC TESTING GUIDE
+================================================================================
+
+This document explains how to set up the ai-doc-interact project on a fresh
+machine, bring up all services, and verify that everything is working correctly.
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+
+  1.  Project Overview
+  2.  Prerequisites
+  3.  Clone and Prepare the Repository
+  4.  Environment Configuration
+  5.  Running the Full Stack with Docker Compose
+  6.  Service Port Reference
+  7.  Basic Smoke Tests (Manual / curl)
+  8.  Running the Automated Test Suites
+  9.  Monitoring — Prometheus and Grafana
+  10. Stopping and Cleaning Up
+  11. Running Services Locally Without Docker (Optional)
+  12. Troubleshooting
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+
+AI-DOC INTERACT is a microservices-based AI document interaction platform.
+It accepts PDF, DOCX, and PPTX files, parses and chunks them, then uses
+HuggingFace transformer models to generate summaries and questions.
+
+Architecture:
+
+  Frontend (Next.js 14)
+      |
+      v
+  Gateway  (FastAPI, port 8000)  <-- single external entry point
+      |--- Auth service    (port 8001)  JWT registration / token issuance
+      |--- Parser service  (port 8002)  PDF / DOCX / PPTX extraction & chunking
+      |--- Summarizer      (port 8003)  HuggingFace BART summarisation (GPU)
+      |--- Question Gen    (port 8004)  HuggingFace T5 question generation (GPU)
+  
+  Infrastructure:
+      PostgreSQL 16     (port 5432)  primary relational store
+      Redis 7           (port 6379)  result cache + rate limiting
+      MLflow            (port 5000)  ML experiment tracking
+      Prometheus        (port 9090)  metrics scraping
+      Grafana           (port 3001)  dashboards
+
+================================================================================
+2. PREREQUISITES
+================================================================================
+
+Install the following on the new machine before proceeding.
+
+  REQUIRED:
+  ---------
+  a) Docker Desktop (or Docker Engine + Docker Compose plugin)
+       Windows / macOS : https://www.docker.com/products/docker-desktop/
+       Linux           : https://docs.docker.com/engine/install/
+       Minimum version : Docker 24+, Compose plugin v2.20+
+
+  b) Git
+       https://git-scm.com/downloads
+
+  REQUIRED (for GPU inference — summarizer and question_gen):
+  -----------------------------------------------------------
+  c) NVIDIA GPU with CUDA support
+       Driver version 525+ is recommended.
+
+  d) NVIDIA Container Toolkit
+       Allows Docker containers to access the host GPU.
+       Install guide: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+
+       Quick install on Ubuntu:
+         sudo apt-get install -y nvidia-container-toolkit
+         sudo nvidia-ctk runtime configure --runtime=docker
+         sudo systemctl restart docker
+
+  OPTIONAL (for local development outside Docker):
+  -------------------------------------------------
+  e) Python 3.11
+       https://www.python.org/downloads/
+
+  f) Node.js 20 LTS + npm
+       https://nodejs.org/
+
+  g) openssl (for generating a secure JWT secret)
+       Included on Linux / macOS.
+       Windows: available via Git Bash, WSL, or the Win32 OpenSSL installer.
+
+  VERIFY DOCKER IS WORKING:
+  -------------------------
+    docker --version
+    docker compose version
+    docker run --rm hello-world
+
+  VERIFY GPU ACCESS (if applicable):
+  -----------------------------------
+    nvidia-smi
+    docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+
+================================================================================
+3. CLONE AND PREPARE THE REPOSITORY
+================================================================================
+
+  git clone <YOUR_REPO_URL> ai-doc-interact
+  cd ai-doc-interact
+
+  Expected top-level structure after cloning:
+
+    .env.example
+    .pre-commit-config.yaml
+    docker-compose.yml
+    pyproject.toml
+    ci/
+    docker/
+      postgres/
+        init.sql
+    frontend/
+    mlops/
+      drift/
+      mlflow/
+      monitoring/
+    services/
+      auth/
+      gateway/
+      parser/
+      question_gen/
+      summarizer/
+    shared/
+
+================================================================================
+4. ENVIRONMENT CONFIGURATION
+================================================================================
+
+The project uses a single .env file at the repository root.
+A template is provided at .env.example.
+
+  STEP 1 — Copy the template:
+
+    Windows (cmd):   copy .env.example .env
+    Windows (PS):    Copy-Item .env.example .env
+    Linux / macOS:   cp .env.example .env
+
+  STEP 2 — Open .env in any text editor and fill in real values:
+
+    # PostgreSQL credentials
+    POSTGRES_USER=aidoc
+    POSTGRES_PASSWORD=<choose a strong password>
+    POSTGRES_DB=aidoc
+
+    # JWT signing secret
+    # Generate a secure value with:
+    #   Linux/macOS: openssl rand -hex 32
+    #   Windows Git Bash / WSL: openssl rand -hex 32
+    JWT_SECRET=<paste the output of openssl rand -hex 32>
+
+    # Grafana admin password (used to log in to the Grafana dashboard)
+    GRAFANA_ADMIN_PASSWORD=<choose a password>
+
+    # Percentage of inference requests routed to ML variant B (0 to 100)
+    # 20 means 80% go to variant A, 20% to variant B
+    AB_VARIANT_B_PERCENT=20
+
+    # HuggingFace model identifiers downloaded at container startup
+    # These are the defaults; change only if you want a different model
+    SUMMARIZER_MODEL=facebook/bart-large-cnn
+    QGEN_MODEL=valhalla/t5-base-qg-hl
+
+  IMPORTANT: Never commit the real .env file to version control.
+             The .gitignore should already exclude it.
+
+================================================================================
+5. RUNNING THE FULL STACK WITH DOCKER COMPOSE
+================================================================================
+
+All commands below are run from the repository root directory.
+
+  BUILD ALL IMAGES AND START ALL SERVICES:
+  -----------------------------------------
+    docker compose up --build
+
+  This will:
+    - Build Docker images for all 5 Python services + the frontend + MLflow
+    - Pull postgres:16-alpine, redis:7-alpine, prom/prometheus, grafana/grafana
+    - Download HuggingFace model weights (several GB on first run — be patient)
+    - Start all 12 containers on the shared bridge network ai_doc_net
+
+  To run in detached (background) mode:
+    docker compose up --build -d
+
+  To watch logs of a specific service after detaching:
+    docker compose logs -f gateway
+    docker compose logs -f summarizer
+
+  STARTUP ORDER AND HEALTH CHECKS:
+  ----------------------------------
+  Docker Compose respects service dependencies defined in docker-compose.yml.
+  postgres and redis must pass their health checks before auth, mlflow, and
+  the inference workers start.  The full stack may take 3-5 minutes to
+  become ready on the first run due to model downloads.
+
+  CHECK ALL CONTAINERS ARE RUNNING:
+  -----------------------------------
+    docker compose ps
+
+  All services should show status "running" (or "healthy" for postgres/redis).
+  If any container shows "exited", check its logs:
+    docker compose logs <service-name>
+
+================================================================================
+6. SERVICE PORT REFERENCE
+================================================================================
+
+  Service           Container Port   Host Port   URL
+  ----------------  ---------------  ----------  ---------------------------
+  Frontend          3000             3000        http://localhost:3000
+  Gateway API       8000             8000        http://localhost:8000
+  Auth service      8001             8001        http://localhost:8001
+  Parser service    8002             8002        http://localhost:8002
+  Summarizer        8003             8003        http://localhost:8003
+  Question Gen      8004             8004        http://localhost:8004
+  MLflow UI         5000             5000        http://localhost:5000
+  PostgreSQL        5432             5432        localhost:5432
+  Redis             6379             6379        localhost:6379
+  Prometheus        9090             9090        http://localhost:9090
+  Grafana           3000 (internal)  3001        http://localhost:3001
+
+================================================================================
+7. BASIC SMOKE TESTS (MANUAL / curl)
+================================================================================
+
+Run these checks after the full stack is up to confirm each service is healthy.
+Replace "curl" with Invoke-WebRequest on Windows PowerShell if curl is not
+available, or use a tool like Postman / Bruno.
+
+  NOTE: On Windows PowerShell you can use:
+    Invoke-WebRequest -Uri http://localhost:<port>/<path> -UseBasicParsing
+
+  7.1 GATEWAY HEALTH
+  -------------------
+    curl http://localhost:8000/health
+
+    Expected response:
+      {"status":"ok","service":"gateway"}
+
+  7.2 AUTH SERVICE HEALTH
+  ------------------------
+    curl http://localhost:8001/health
+
+    Expected response:
+      {"status":"ok","service":"auth"}
+
+  7.3 PARSER SERVICE HEALTH
+  --------------------------
+    curl http://localhost:8002/health
+
+    Expected response:
+      {"status":"ok","service":"parser"}
+
+  7.4 SUMMARIZER HEALTH
+  ----------------------
+    curl http://localhost:8003/health
+
+    Expected response:
+      {"status":"ok","service":"summarizer"}
+
+  7.5 QUESTION GEN HEALTH
+  ------------------------
+    curl http://localhost:8004/health
+
+    Expected response:
+      {"status":"ok","service":"question_gen"}
+
+  7.6 MLFLOW UI
+  --------------
+    Open http://localhost:5000 in a browser.
+    You should see the MLflow Tracking UI with an empty experiments list.
+
+  7.7 FRONTEND
+  -------------
+    Open http://localhost:3000 in a browser.
+    You should see the AI-Doc Interact login / upload page.
+
+  7.8 REGISTER A USER AND OBTAIN A JWT TOKEN
+  -------------------------------------------
+    Register:
+      curl -X POST http://localhost:8001/auth/register \
+        -H "Content-Type: application/json" \
+        -d '{"username":"testuser","email":"test@example.com","password":"Test1234!"}'
+
+    Expected response (201 or 200):
+      {"id":"<uuid>","username":"testuser","email":"test@example.com"}
+
+    Login and get a token:
+      curl -X POST http://localhost:8001/auth/token \
+        -H "Content-Type: application/json" \
+        -d '{"username":"testuser","password":"Test1234!"}'
+
+    Expected response:
+      {"access_token":"<jwt>","token_type":"bearer"}
+
+    Save the token for the next step:
+      TOKEN=<paste the access_token value here>
+
+  7.9 UPLOAD A DOCUMENT THROUGH THE GATEWAY
+  -------------------------------------------
+    Use any small PDF, DOCX, or PPTX file on your machine.
+
+      curl -X POST http://localhost:8000/upload \
+        -H "Authorization: Bearer $TOKEN" \
+        -F "file=@/path/to/your/document.pdf"
+
+    Expected response (may take 30-60 seconds while models run):
+      {
+        "summary": "<generated summary text>",
+        "questions": ["<question 1>", "<question 2>", ...],
+        "chunks": [...]
+      }
+
+  7.10 PROMETHEUS TARGETS
+  ------------------------
+    Open http://localhost:9090/targets in a browser.
+    You should see scrape targets for:
+      - prometheus (self)
+      - parser:8002/metrics  (state: UP)
+      - summarizer:8003/metrics  (state: UP)
+      - question_gen:8004/metrics  (state: UP)
+    
+    Note: gateway and auth do not currently expose /metrics, so those
+    targets may show as DOWN — this is a known limitation.
+
+  7.11 GRAFANA DASHBOARD
+  -----------------------
+    Open http://localhost:3001 in a browser.
+    Login with:
+      Username: admin
+      Password: <value of GRAFANA_ADMIN_PASSWORD from your .env>
+    You should see pre-provisioned datasources and dashboards.
+
+================================================================================
+8. RUNNING THE AUTOMATED TEST SUITES
+================================================================================
+
+There are two pytest suites included: one for the auth service and one for
+the parser service.  Both run entirely in-process and do not require a live
+database or Redis connection.
+
+  OPTION A — Run tests inside Docker (recommended, no local Python needed):
+  --------------------------------------------------------------------------
+
+    Auth tests:
+      docker compose exec auth pytest tests/ -v
+
+    Parser tests:
+      docker compose exec parser pytest tests/ -v
+
+  OPTION B — Run tests locally with Python 3.11:
+  -----------------------------------------------
+
+  Install dependencies for each service into a virtual environment first.
+
+    AUTH SERVICE TESTS:
+      cd services/auth
+      python -m venv .venv
+      .venv\Scripts\activate          (Windows)
+      source .venv/bin/activate       (Linux / macOS)
+      pip install -r requirements.txt
+      pip install pytest pytest-asyncio
+      pytest tests/ -v
+      deactivate
+
+    PARSER SERVICE TESTS:
+      cd services/parser
+      python -m venv .venv
+      .venv\Scripts\activate          (Windows)
+      source .venv/bin/activate       (Linux / macOS)
+      pip install -r requirements.txt
+      pip install pytest pytest-asyncio
+      pytest tests/ -v
+      deactivate
+
+  EXPECTED TEST OUTPUT — AUTH:
+  -----------------------------
+    tests/test_auth.py::TestCreateAccessToken::test_token_contains_expected_claims  PASSED
+    tests/test_auth.py::TestCreateAccessToken::test_jti_is_unique_across_calls      PASSED
+    tests/test_auth.py::TestCreateAccessToken::test_token_algorithm_is_hs256        PASSED
+    tests/test_auth.py::TestTokenExpiry::test_expired_token_raises_401              PASSED
+    tests/test_auth.py::TestTokenExpiry::test_valid_token_does_not_raise            PASSED
+    tests/test_auth.py::TestDecodeInvalidToken::test_wrong_secret_raises_401        PASSED
+    tests/test_auth.py::TestDecodeInvalidToken::test_malformed_token_raises_401     PASSED
+    tests/test_auth.py::TestDecodeInvalidToken::test_empty_token_raises_401         PASSED
+    tests/test_auth.py::TestPasswordHashing::test_hash_is_not_plaintext             PASSED
+    tests/test_auth.py::TestPasswordHashing::test_correct_password_verifies         PASSED
+    tests/test_auth.py::TestPasswordHashing::test_wrong_password_fails              PASSED
+    tests/test_auth.py::TestPasswordHashing::test_each_hash_is_unique_due_to_salt   PASSED
+    tests/test_auth.py::TestRateLimit::test_allows_requests_under_limit             PASSED
+    tests/test_auth.py::TestRateLimit::test_blocks_request_over_limit               PASSED
+    tests/test_auth.py::TestRateLimit::test_expire_called_only_on_first_increment   PASSED
+
+  EXPECTED TEST OUTPUT — PARSER:
+  --------------------------------
+    tests/test_parser.py::TestExtractTextPDF::test_extracts_text_from_valid_pdf       PASSED
+    tests/test_parser.py::TestExtractTextPDF::test_page_count_matches_actual_pages    PASSED
+    tests/test_parser.py::TestExtractTextDOCX::test_extracts_paragraphs_from_docx     PASSED
+    tests/test_parser.py::TestExtractTextDOCX::test_empty_paragraphs_are_skipped      PASSED
+    tests/test_parser.py::TestExtractTextPPTX::test_extracts_text_from_pptx           PASSED
+    tests/test_parser.py::TestExtractTextPPTX::test_page_count_equals_slide_count     PASSED
+    tests/test_parser.py::TestCleanText::test_removes_control_characters              PASSED
+    tests/test_parser.py::TestCleanText::test_collapses_multiple_blank_lines          PASSED
+    tests/test_parser.py::TestCleanText::test_strips_leading_trailing_whitespace      PASSED
+    tests/test_parser.py::TestCleanText::test_header_footer_lines_removed             PASSED
+    tests/test_parser.py::TestChunkText::test_single_short_text_produces_one_chunk    PASSED
+    tests/test_parser.py::TestChunkText::test_long_text_produces_multiple_chunks      PASSED
+    tests/test_parser.py::TestChunkText::test_every_chunk_within_token_limit          PASSED
+    tests/test_parser.py::TestChunkText::test_chunk_ids_are_sequential                PASSED
+
+  All tests should pass with no errors or warnings.
+
+================================================================================
+9. MONITORING — PROMETHEUS AND GRAFANA
+================================================================================
+
+  Prometheus scrapes metrics from parser, summarizer, and question_gen at
+  their /metrics endpoints.  The scrape config is defined in:
+    mlops/monitoring/prometheus.yml
+
+  Grafana is pre-provisioned with:
+    - Datasource: Prometheus at http://prometheus:9090
+    - Dashboards: defined in mlops/monitoring/grafana/dashboards/
+
+  To explore metrics manually, open:
+    http://localhost:9090                 (Prometheus query UI)
+    http://localhost:3001/dashboards      (Grafana dashboard list)
+
+  Example Prometheus queries to verify data is flowing:
+    - process_cpu_seconds_total{job="parser"}
+    - http_requests_total
+
+================================================================================
+10. STOPPING AND CLEANING UP
+================================================================================
+
+  STOP ALL SERVICES (keep volumes / images):
+    docker compose down
+
+  STOP AND REMOVE VOLUMES (deletes database data, Redis data, MLflow artifacts):
+    docker compose down -v
+
+  REMOVE ALL BUILT IMAGES AS WELL:
+    docker compose down -v --rmi all
+
+  PRUNE UNUSED DOCKER RESOURCES (system-wide):
+    docker system prune -f
+
+================================================================================
+11. RUNNING SERVICES LOCALLY WITHOUT DOCKER (OPTIONAL)
+================================================================================
+
+This is useful for active development on a single service.
+You still need postgres and redis running (easiest via Docker).
+
+  START ONLY INFRASTRUCTURE WITH DOCKER:
+    docker compose up -d postgres redis
+
+  RUN A SERVICE LOCALLY (example: auth):
+    cd services/auth
+    python -m venv .venv
+    .venv\Scripts\activate          (Windows)
+    source .venv/bin/activate       (Linux / macOS)
+    pip install -r requirements.txt
+
+    Set environment variables:
+      Windows PowerShell:
+        $env:DATABASE_URL = "postgresql://aidoc:<password>@localhost:5432/aidoc"
+        $env:REDIS_URL    = "redis://localhost:6379/0"
+        $env:JWT_SECRET   = "<your jwt secret>"
+
+      Linux / macOS:
+        export DATABASE_URL="postgresql://aidoc:<password>@localhost:5432/aidoc"
+        export REDIS_URL="redis://localhost:6379/0"
+        export JWT_SECRET="<your jwt secret>"
+
+    Start the service:
+      uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+
+  RUN THE FRONTEND LOCALLY:
+    cd frontend
+    npm install
+    NEXT_PUBLIC_GATEWAY_URL=http://localhost:8000 npm run dev
+
+    Open http://localhost:3000 in a browser.
+
+  LINTING AND TYPE CHECKING (requires Python 3.11 + ruff + mypy):
+    pip install ruff mypy
+    ruff check services/ shared/ mlops/
+    mypy services/ shared/ mlops/
+
+================================================================================
+12. TROUBLESHOOTING
+================================================================================
+
+  PROBLEM: A container exits immediately at startup
+  -------------------------------------------------
+    Check its logs:
+      docker compose logs <service-name>
+    Common causes:
+      - Missing or incorrect value in .env
+      - postgres not yet healthy when auth or gateway tries to connect
+        (run "docker compose up" again; health checks prevent most race conditions)
+
+  PROBLEM: Summarizer or question_gen container fails with GPU errors
+  -------------------------------------------------------------------
+    - Confirm NVIDIA drivers are installed: nvidia-smi
+    - Confirm NVIDIA Container Toolkit is installed and configured
+    - If no GPU is available, remove the "deploy.resources.reservations"
+      block from both services in docker-compose.yml.  The models will then
+      run on CPU — significantly slower but still functional.
+
+  PROBLEM: HuggingFace model download fails or is very slow
+  ----------------------------------------------------------
+    - Model weights are downloaded from https://huggingface.co on first run.
+      Ensure outbound HTTPS access to huggingface.co is not blocked.
+    - To pre-download models, set HUGGINGFACE_HUB_CACHE to a shared volume
+      or download them manually and mount into the container.
+
+  PROBLEM: Frontend shows "cannot connect to gateway"
+  ----------------------------------------------------
+    - Confirm the gateway container is running: docker compose ps
+    - Check that NEXT_PUBLIC_GATEWAY_URL=http://localhost:8000 in .env
+    - Check gateway logs: docker compose logs gateway
+
+  PROBLEM: "port already in use" errors on startup
+  -------------------------------------------------
+    Another process is using one of the required ports.
+    Identify it and stop it, or change the host-side port mapping in
+    docker-compose.yml (change only the left side of "HOST:CONTAINER").
+
+  PROBLEM: pytest cannot import the service module
+  ------------------------------------------------
+    Ensure you installed the service-specific requirements.txt (not the
+    root pyproject.toml, which is lint/typecheck only and has no [project]
+    dependencies).
+
+================================================================================
+END OF DOCUMENT
+================================================================================

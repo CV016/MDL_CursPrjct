@@ -1,0 +1,62 @@
+# =============================================================================
+# AI-DOC INTERACT — pre-commit hook configuration
+# Run `pre-commit install` once after cloning to activate all hooks.
+# All hooks run automatically on `git commit`.
+# =============================================================================
+
+repos:
+
+  # --------------------------------------------------------------------------
+  # Standard file hygiene hooks (trailing whitespace, EOF newlines, etc.)
+  # --------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        name: Trim trailing whitespace
+      - id: end-of-file-fixer
+        name: Ensure files end with a newline
+      - id: check-yaml
+        name: Validate YAML syntax
+      - id: check-toml
+        name: Validate TOML syntax
+      - id: check-json
+        name: Validate JSON syntax
+      - id: check-merge-conflict
+        name: Detect unresolved merge conflict markers
+      - id: debug-statements
+        name: Detect debug statements (pdb, breakpoint, etc.)
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+        name: Block large file commits (>1 MB)
+
+  # --------------------------------------------------------------------------
+  # ruff — fast Python linter (replaces flake8 + isort + pyupgrade)
+  # --------------------------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.4
+    hooks:
+      - id: ruff
+        name: ruff lint
+        args: ["--fix", "--exit-non-zero-on-fix"]
+      - id: ruff-format
+        name: ruff format
+
+  # --------------------------------------------------------------------------
+  # mypy — static type checking
+  # Runs against all Python service directories.
+  # --------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        name: mypy type check
+        additional_dependencies:
+          - "pydantic>=2.0"
+          - "fastapi>=0.110"
+          - "types-redis"
+          - "types-PyYAML"
+          - "types-passlib"
+        args: ["--config-file=pyproject.toml"]
+        # Run mypy on all service packages
+        files: ^(services|shared|mlops)/

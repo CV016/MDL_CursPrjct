@@ -1,0 +1,13 @@
+# =============================================================================
+# Question-generation service Python dependencies
+# =============================================================================
+
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+transformers==4.41.0
+torch==2.3.0
+mlflow==2.13.0
+prometheus-client==0.20.0
+pydantic==2.7.1
+accelerate==0.30.0
+sentencepiece==0.2.0

@@ -1,0 +1,83 @@
+# =============================================================================
+# AI-DOC INTERACT — root pyproject.toml
+# Contains ruff (linter/formatter) and mypy (type checker) configuration
+# shared across all Python services.
+# =============================================================================
+
+[tool.ruff]
+# Maximum line length enforced by both ruff format and ruff check
+line-length = 120
+
+# Target Python version used for syntax checks
+target-version = "py311"
+
+# Source directories scanned by ruff
+src = ["services", "shared", "mlops"]
+
+[tool.ruff.lint]
+# Enable a broad rule set:
+#   E/W  — pycodestyle errors and warnings
+#   F    — pyflakes
+#   I    — isort
+#   UP   — pyupgrade
+#   B    — flake8-bugbear
+#   C4   — flake8-comprehensions
+#   SIM  — flake8-simplify
+#   TCH  — flake8-type-checking (move type-only imports into TYPE_CHECKING blocks)
+#   ANN  — flake8-annotations (enforce type hints)
+select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "TCH", "ANN"]
+
+# Ignore rules that conflict with strict type annotations on every helper
+ignore = [
+    "ANN101",  # missing type annotation for `self`
+    "ANN102",  # missing type annotation for `cls`
+    "ANN401",  # dynamically typed expressions (Any) are allowed where needed
+]
+
+[tool.ruff.lint.isort]
+# Group first-party packages together
+known-first-party = ["shared", "services"]
+
+[tool.ruff.format]
+# Use double quotes for consistency with Black-style formatting
+quote-style = "double"
+indent-style = "space"
+
+# ---------------------------------------------------------------------------
+# mypy — strict type checking for all services
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+# Emit errors for missing stubs; install stubs packages (types-*) as needed
+ignore_missing_imports = false
+
+# Disallow `Any` to bleed through function boundaries
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+warn_unreachable = true
+
+# Per-module overrides for third-party libraries that lack complete stubs
+[[tool.mypy.overrides]]
+module = [
+    "fitz.*",           # PyMuPDF
+    "docx.*",           # python-docx
+    "pptx.*",           # python-pptx
+    "celery.*",
+    "rq.*",
+    "redis.*",
+    "prometheus_client.*",
+    "evidently.*",
+    "mlflow.*",
+]
+ignore_missing_imports = true

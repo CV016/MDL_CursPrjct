@@ -1,0 +1,81 @@
+# =============================================================================
+# Prometheus scrape configuration for AI-DOC INTERACT
+# All service metrics endpoints are scraped every 15 seconds.
+# =============================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  # Attach these labels to every time series collected from this Prometheus instance
+  external_labels:
+    environment: "local"
+    project: "ai-doc-interact"
+
+# ---------------------------------------------------------------------------
+# Alerting configuration (stub — configure Alertmanager separately)
+# ---------------------------------------------------------------------------
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# ---------------------------------------------------------------------------
+# Scrape jobs
+# ---------------------------------------------------------------------------
+
+scrape_configs:
+
+  # Prometheus self-monitoring
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # API Gateway
+  - job_name: "gateway"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["gateway:8000"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: service
+        replacement: "gateway"
+
+  # Auth service
+  - job_name: "auth"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["auth:8001"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: service
+        replacement: "auth"
+
+  # Parser service — exposes parser_input_tokens_total counter
+  - job_name: "parser"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["parser:8002"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: service
+        replacement: "parser"
+
+  # Summarizer worker
+  - job_name: "summarizer"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["summarizer:8003"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: service
+        replacement: "summarizer"
+
+  # Question-generation worker
+  - job_name: "question_gen"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["question_gen:8004"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: service
+        replacement: "question_gen"
