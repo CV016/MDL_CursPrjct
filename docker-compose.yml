@@ -1,28 +1,32 @@
 # =============================================================================
 # AI-DOC INTERACT — Docker Compose Stack
-# Brings up all services, infrastructure, and MLOps tooling locally.
-# GPU sharing is handled through NVIDIA Container Toolkit device reservations
-# on the inference workers (summarizer, question_gen).
+#
+# Three services on a shared bridge network:
+#   mlflow-server  (port 5000) — self-hosted MLflow with SQLite backend
+#   backend-api    (port 8000) — FastAPI with both HuggingFace models + GPU
+#   frontend-ui    (port 8501) — Streamlit UI
+#
+# GPU note:
+#   backend-api requests one NVIDIA GPU via the deploy.resources block.
+#   The NVIDIA Container Toolkit must be installed and configured on the host
+#   (standard on university GPU servers).  If GPU is unavailable the service
+#   falls back to CPU automatically — no code change is needed.
+#
+# Model cache note:
+#   HuggingFace model weights (~1.85 GB total) are stored in ./hf_cache on
+#   the host and bind-mounted into the container.  This means the download
+#   happens only once even if you run `docker compose down` and restart.
+#   On a shared server, point HF_CACHE_HOST_PATH to a directory on /data
+#   to avoid filling the home directory.
 # =============================================================================
 
 version: "3.9"
 
-# ---------------------------------------------------------------------------
-# Named volumes shared across services
-# ---------------------------------------------------------------------------
 volumes:
-  postgres_data:
-    driver: local
-  mlflow_artifacts:
-    driver: local
-  redis_data:
-    driver: local
-  grafana_data:
+  # Holds mlflow.db (SQLite experiment database) and the artifact directories
+  mlflow_data:
     driver: local
 
-# ---------------------------------------------------------------------------
-# Custom bridge network so services resolve each other by service name
-# ---------------------------------------------------------------------------
 networks:
   ai_doc_net:
     driver: bridge
@@ -30,253 +34,86 @@ networks:
 services:
 
   # --------------------------------------------------------------------------
-  # PostgreSQL — primary relational store
-  # Initialised with docker/postgres/init.sql on first boot
+  # MLflow tracking server — SQLite backend, no external database required
   # --------------------------------------------------------------------------
-  postgres:
-    image: postgres:16-alpine
-    container_name: ai_doc_postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-aidoc}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aidoc_secret}
-      POSTGRES_DB: ${POSTGRES_DB:-aidoc}
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aidoc}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - ai_doc_net
-
-  # --------------------------------------------------------------------------
-  # Redis — result cache (TTL 10 min) and Celery / rq job queue
-  # --------------------------------------------------------------------------
-  redis:
-    image: redis:7-alpine
-    container_name: ai_doc_redis
-    restart: unless-stopped
-    command: redis-server --save 60 1 --loglevel warning
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - ai_doc_net
-
-  # --------------------------------------------------------------------------
-  # MLflow tracking server
-  # Artifacts are stored in a named volume; metadata in PostgreSQL.
-  # --------------------------------------------------------------------------
-  mlflow:
+  mlflow-server:
     build:
       context: ./mlops/mlflow
       dockerfile: Dockerfile
     container_name: ai_doc_mlflow
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
     environment:
-      MLFLOW_BACKEND_STORE_URI: postgresql://${POSTGRES_USER:-aidoc}:${POSTGRES_PASSWORD:-aidoc_secret}@postgres:5432/${POSTGRES_DB:-aidoc}
+      MLFLOW_BACKEND_STORE_URI: sqlite:////mlflow/mlflow.db
       MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
     ports:
       - "5000:5000"
     volumes:
-      - mlflow_artifacts:/mlflow/artifacts
+      - mlflow_data:/mlflow
     networks:
       - ai_doc_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # --------------------------------------------------------------------------
-  # Auth service — JWT issuance and user management
+  # Backend API — GPU-accelerated inference with epsilon-greedy A/B routing
   # --------------------------------------------------------------------------
-  auth:
+  backend-api:
     build:
-      context: ./services/auth
+      context: ./backend
       dockerfile: Dockerfile
-    container_name: ai_doc_auth
+    container_name: ai_doc_backend
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
+      mlflow-server:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-aidoc}:${POSTGRES_PASSWORD:-aidoc_secret}@postgres:5432/${POSTGRES_DB:-aidoc}
-      REDIS_URL: redis://redis:6379/0
-      JWT_SECRET: ${JWT_SECRET:-change_me_in_production}
-      JWT_ALGORITHM: HS256
-      JWT_EXPIRE_MINUTES: 60
-    ports:
-      - "8001:8001"
-    networks:
-      - ai_doc_net
-
-  # --------------------------------------------------------------------------
-  # Parser service — document ingestion and chunking
-  # --------------------------------------------------------------------------
-  parser:
-    build:
-      context: ./services/parser
-      dockerfile: Dockerfile
-    container_name: ai_doc_parser
-    restart: unless-stopped
-    environment:
-      REDIS_URL: redis://redis:6379/1
-      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus_multiproc
-    ports:
-      - "8002:8002"
-    networks:
-      - ai_doc_net
-
-  # --------------------------------------------------------------------------
-  # Summarizer inference worker — GPU-enabled
-  # --------------------------------------------------------------------------
-  summarizer:
-    build:
-      context: ./services/summarizer
-      dockerfile: Dockerfile
-    container_name: ai_doc_summarizer
-    restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
-    environment:
-      REDIS_URL: redis://redis:6379/2
-      MLFLOW_TRACKING_URI: http://mlflow:5000
-      MODEL_NAME: ${SUMMARIZER_MODEL:-facebook/bart-large-cnn}
-    ports:
-      - "8003:8003"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    networks:
-      - ai_doc_net
-
-  # --------------------------------------------------------------------------
-  # Question-generation inference worker — GPU-enabled
-  # --------------------------------------------------------------------------
-  question_gen:
-    build:
-      context: ./services/question_gen
-      dockerfile: Dockerfile
-    container_name: ai_doc_question_gen
-    restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
-    environment:
-      REDIS_URL: redis://redis:6379/3
-      MLFLOW_TRACKING_URI: http://mlflow:5000
-      MODEL_NAME: ${QGEN_MODEL:-valhalla/t5-base-qg-hl}
-    ports:
-      - "8004:8004"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    networks:
-      - ai_doc_net
-
-  # --------------------------------------------------------------------------
-  # API Gateway — reverse proxy, A/B routing, and feedback ingestion
-  # --------------------------------------------------------------------------
-  gateway:
-    build:
-      context: ./services/gateway
-      dockerfile: Dockerfile
-    container_name: ai_doc_gateway
-    restart: unless-stopped
-    depends_on:
-      - auth
-      - parser
-      - summarizer
-      - question_gen
-    environment:
-      AUTH_SERVICE_URL: http://auth:8001
-      PARSER_SERVICE_URL: http://parser:8002
-      SUMMARIZER_SERVICE_URL: http://summarizer:8003
-      QUESTION_GEN_SERVICE_URL: http://question_gen:8004
-      REDIS_URL: redis://redis:6379/4
-      DATABASE_URL: postgresql://${POSTGRES_USER:-aidoc}:${POSTGRES_PASSWORD:-aidoc_secret}@postgres:5432/${POSTGRES_DB:-aidoc}
-      # A/B traffic split: percentage routed to variant B (0-100)
-      AB_VARIANT_B_PERCENT: ${AB_VARIANT_B_PERCENT:-20}
+      MLFLOW_TRACKING_URI: http://mlflow-server:5000
+      MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-ai_doc_interact}
+      MODEL_BART: ${MODEL_BART:-facebook/bart-large-cnn}
+      MODEL_FLAN: ${MODEL_FLAN:-google/flan-t5-base}
+      MOCK_JWT_TOKEN: ${MOCK_JWT_TOKEN:-mock-jwt-token-for-academic-project}
+      EPSILON: ${EPSILON:-0.1}
+      # HF_HOME is set in the Dockerfile to /hf_cache; this bind mount maps
+      # that path to a persistent directory on the host.
+      HF_HOME: /hf_cache
     ports:
       - "8000:8000"
-    networks:
-      - ai_doc_net
-
-  # --------------------------------------------------------------------------
-  # Prometheus — metrics scraping
-  # --------------------------------------------------------------------------
-  prometheus:
-    image: prom/prometheus:v2.51.0
-    container_name: ai_doc_prometheus
-    restart: unless-stopped
-    ports:
-      - "9090:9090"
     volumes:
-      - ./mlops/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--web.enable-lifecycle"
+      # Bind-mount the host model cache directory so weights persist.
+      # Change the left side to a path on /data if your admin recommends it,
+      # e.g.:  /data/${USER}/hf_cache:/hf_cache
+      - ./hf_cache:/hf_cache
+    # GPU access — requests one NVIDIA GPU from the host via Container Toolkit.
+    # Remove this entire deploy block if you want to force CPU-only mode.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     networks:
       - ai_doc_net
 
   # --------------------------------------------------------------------------
-  # Grafana — dashboards
+  # Streamlit frontend — lightweight; no GPU needed
   # --------------------------------------------------------------------------
-  grafana:
-    image: grafana/grafana:10.4.0
-    container_name: ai_doc_grafana
-    restart: unless-stopped
-    depends_on:
-      - prometheus
-    ports:
-      - "3001:3000"
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./mlops/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
-      - ./mlops/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
-    networks:
-      - ai_doc_net
-
-  # --------------------------------------------------------------------------
-  # Frontend — Next.js 14 App Router
-  # --------------------------------------------------------------------------
-  frontend:
+  frontend-ui:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: ai_doc_frontend
     restart: unless-stopped
     depends_on:
-      - gateway
+      - backend-api
     environment:
-      NEXT_PUBLIC_GATEWAY_URL: http://localhost:8000
-      # Internal URL used during SSR
-      GATEWAY_INTERNAL_URL: http://gateway:8000
+      BACKEND_URL: http://backend-api:8000
+      MOCK_JWT_TOKEN: ${MOCK_JWT_TOKEN:-mock-jwt-token-for-academic-project}
     ports:
-      - "3000:3000"
+      - "8501:8501"
     networks:
       - ai_doc_net

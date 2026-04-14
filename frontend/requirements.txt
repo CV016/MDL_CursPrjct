@@ -1,0 +1,10 @@
+# =============================================================================
+# frontend/requirements.txt
+# Python dependencies for the Streamlit frontend-ui service.
+# =============================================================================
+
+# Streamlit web framework — all UI components
+streamlit==1.35.0
+
+# HTTP client used to call the backend-api REST endpoints
+requests==2.32.3

@@ -1,0 +1,134 @@
+# =============================================================================
+# .github/workflows/main.yml
+# AI-DOC INTERACT — GitHub Actions CI Pipeline
+#
+# Triggers on every push to main and on pull requests targeting main.
+#
+# Pipeline stages (sequential, each depends on the previous):
+#
+#   1. lint     — flake8 syntax and style check across backend and frontend
+#   2. test     — pytest unit + integration tests for the backend-api service
+#   3. build    — docker compose build to confirm all images compile cleanly
+#
+# No secrets are required — the test suite mocks all external dependencies
+# (MLflow, HuggingFace models) so the pipeline runs entirely on the runner.
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+
+  # --------------------------------------------------------------------------
+  # Stage 1 — Lint with flake8
+  # Checks syntax errors (E9, F-series) and common style violations across
+  # the backend and frontend Python source files.
+  # --------------------------------------------------------------------------
+  lint:
+    name: Lint (flake8)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install flake8
+        run: pip install flake8==7.0.0
+
+      - name: Run flake8 on backend source
+        # E501: max line length 120 (more readable than the default 79)
+        # W503: line break before binary operator (conflicts with Black style)
+        run: |
+          flake8 backend/main.py \
+            --max-line-length=120 \
+            --extend-ignore=W503
+
+      - name: Run flake8 on frontend source
+        run: |
+          flake8 frontend/app.py \
+            --max-line-length=120 \
+            --extend-ignore=W503
+
+      - name: Run flake8 on test files
+        run: |
+          flake8 backend/tests/ \
+            --max-line-length=120 \
+            --extend-ignore=W503
+
+  # --------------------------------------------------------------------------
+  # Stage 2 — Unit and integration tests with pytest
+  # Heavy ML dependencies (torch, transformers) are mocked in conftest.py so
+  # no model weights are downloaded and the test suite completes in seconds.
+  # --------------------------------------------------------------------------
+  test:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install test dependencies
+        # Install only the libraries needed to run the test suite.
+        # torch and transformers are NOT installed here — they are replaced
+        # by MagicMock objects in backend/tests/conftest.py.
+        run: |
+          pip install \
+            fastapi==0.111.0 \
+            uvicorn==0.29.0 \
+            httpx==0.27.0 \
+            pydantic==2.7.1 \
+            mlflow==2.13.0 \
+            PyPDF2==3.0.1 \
+            python-docx==1.1.2 \
+            python-pptx==0.6.23 \
+            textstat==0.7.3 \
+            pytest==8.2.0 \
+            pytest-asyncio==0.23.7
+
+      - name: Run pytest
+        # Run from the repository root; conftest.py adds backend/ to sys.path
+        run: pytest backend/tests/ -v --tb=short
+
+  # --------------------------------------------------------------------------
+  # Stage 3 — Docker Compose build
+  # Verifies that every Dockerfile compiles successfully without errors.
+  # No containers are started — only `docker compose build` is executed.
+  # --------------------------------------------------------------------------
+  build:
+    name: Docker Compose Build
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build all service images
+        # Build without starting containers; --no-cache ensures a clean build
+        # matching what would happen on a fresh deployment machine.
+        run: docker compose build --no-cache

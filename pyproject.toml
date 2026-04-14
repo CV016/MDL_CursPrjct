@@ -1,83 +1,46 @@
 # =============================================================================
 # AI-DOC INTERACT — root pyproject.toml
-# Contains ruff (linter/formatter) and mypy (type checker) configuration
-# shared across all Python services.
+#
+# Contains configuration for the tools used in the project:
+#   flake8  — syntax and style linting (run via GitHub Actions CI)
+#   pytest  — test runner configuration
 # =============================================================================
 
-[tool.ruff]
-# Maximum line length enforced by both ruff format and ruff check
-line-length = 120
-
-# Target Python version used for syntax checks
-target-version = "py311"
-
-# Source directories scanned by ruff
-src = ["services", "shared", "mlops"]
-
-[tool.ruff.lint]
-# Enable a broad rule set:
-#   E/W  — pycodestyle errors and warnings
-#   F    — pyflakes
-#   I    — isort
-#   UP   — pyupgrade
-#   B    — flake8-bugbear
-#   C4   — flake8-comprehensions
-#   SIM  — flake8-simplify
-#   TCH  — flake8-type-checking (move type-only imports into TYPE_CHECKING blocks)
-#   ANN  — flake8-annotations (enforce type hints)
-select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "TCH", "ANN"]
-
-# Ignore rules that conflict with strict type annotations on every helper
-ignore = [
-    "ANN101",  # missing type annotation for `self`
-    "ANN102",  # missing type annotation for `cls`
-    "ANN401",  # dynamically typed expressions (Any) are allowed where needed
+# ---------------------------------------------------------------------------
+# flake8 — linting configuration
+# flake8 reads this section when invoked with --toml-config or via setup.cfg;
+# the canonical way to configure flake8 in pyproject.toml requires the
+# Flake8-pyproject plugin. The CI workflow passes flags directly on the
+# command line so this section is provided for local development convenience.
+# ---------------------------------------------------------------------------
+[tool.flake8]
+max-line-length = 120
+extend-ignore = [
+    "W503",   # line break before binary operator (Black-compatible style)
+    "E203",   # whitespace before ':' (Black-compatible style)
+]
+exclude = [
+    "__pycache__",
+    ".git",
+    ".venv",
+    "*.egg-info",
+]
+per-file-ignores = [
+    # Test files may use longer lines in assertion messages
+    "backend/tests/*.py:E501",
 ]
 
-[tool.ruff.lint.isort]
-# Group first-party packages together
-known-first-party = ["shared", "services"]
-
-[tool.ruff.format]
-# Use double quotes for consistency with Black-style formatting
-quote-style = "double"
-indent-style = "space"
-
 # ---------------------------------------------------------------------------
-# mypy — strict type checking for all services
+# pytest — test runner configuration
 # ---------------------------------------------------------------------------
-[tool.mypy]
-python_version = "3.11"
-strict = true
+[tool.pytest.ini_options]
+# Default test collection paths
+testpaths = ["backend/tests"]
 
-# Emit errors for missing stubs; install stubs packages (types-*) as needed
-ignore_missing_imports = false
+# Show individual test names even without -v flag
+addopts = "-v --tb=short"
 
-# Disallow `Any` to bleed through function boundaries
-disallow_any_generics = true
-disallow_subclassing_any = true
-disallow_untyped_calls = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-check_untyped_defs = true
-disallow_untyped_decorators = true
-
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_return_any = true
-warn_unreachable = true
-
-# Per-module overrides for third-party libraries that lack complete stubs
-[[tool.mypy.overrides]]
-module = [
-    "fitz.*",           # PyMuPDF
-    "docx.*",           # python-docx
-    "pptx.*",           # python-pptx
-    "celery.*",
-    "rq.*",
-    "redis.*",
-    "prometheus_client.*",
-    "evidently.*",
-    "mlflow.*",
+# Treat DeprecationWarnings from third-party libraries as non-fatal
+filterwarnings = [
+    "ignore::DeprecationWarning",
 ]
-ignore_missing_imports = true

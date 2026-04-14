@@ -1,0 +1,33 @@
+# =============================================================================
+# backend/requirements.txt
+# Python dependencies for the backend-api service.
+# Pin minor versions for reproducible Docker image builds.
+# =============================================================================
+
+# Web framework and ASGI server
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# Pydantic v2 — FastAPI's data validation layer
+pydantic==2.7.1
+
+# HuggingFace model inference
+transformers==4.41.1
+# PyTorch is intentionally NOT pinned here because the CPU and CUDA builds
+# are distributed from different package indexes and cannot share the same
+# requirements.txt line.  See the Dockerfile and the local setup instructions
+# in SETUP.txt for the correct pip install command for each environment.
+
+# Document parsing
+PyPDF2==3.0.1
+python-docx==1.1.2
+python-pptx==0.6.23
+
+# Readability scoring for drift detection
+textstat==0.7.3
+
+# MLflow experiment tracking client
+mlflow==2.13.0
+
+# Accelerate (optional HuggingFace dependency for device placement)
+accelerate==0.30.1

@@ -1,49 +1,31 @@
 # =============================================================================
-# Frontend Dockerfile — Next.js 14 App Router
-# Uses the official Node.js Alpine image.
-# Multi-stage build: deps -> builder -> runtime
-# The standalone output mode copies only the minimum required files.
+# frontend/Dockerfile
+#
+# Builds the Streamlit frontend-ui service image.
+# The image is intentionally minimal — only Streamlit and the requests library
+# are installed; all ML and data processing happens in the backend-api service.
 # =============================================================================
 
-# ---- Stage 1: install dependencies ----
-FROM node:20-alpine AS deps
+FROM python:3.11-slim AS runtime
+
+# Prevent .pyc files; enable unbuffered logs for docker compose logs
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Copy package manifests only to leverage Docker layer caching
-COPY package.json package-lock.json* ./
-RUN npm ci --frozen-lockfile
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# ---- Stage 2: build the Next.js app ----
-FROM node:20-alpine AS builder
+COPY app.py .
 
-WORKDIR /app
+EXPOSE 8501
 
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-
-# Build args injected by docker-compose
-ARG NEXT_PUBLIC_GATEWAY_URL=http://localhost:8000
-ENV NEXT_PUBLIC_GATEWAY_URL=$NEXT_PUBLIC_GATEWAY_URL
-
-RUN npm run build
-
-# ---- Stage 3: minimal runtime image ----
-FROM node:20-alpine AS runtime
-
-WORKDIR /app
-
-RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
-
-# Copy the standalone bundle produced by `output: "standalone"` in next.config.js
-COPY --from=builder --chown=appuser:appgroup /app/.next/standalone ./
-COPY --from=builder --chown=appuser:appgroup /app/.next/static ./.next/static
-COPY --from=builder --chown=appuser:appgroup /app/public ./public
-
-USER appuser
-EXPOSE 3000
-
-ENV PORT=3000
-ENV NODE_ENV=production
-
-CMD ["node", "server.js"]
+# Streamlit configuration flags:
+#   --server.headless=true   — disables browser auto-open in container context
+#   --server.fileWatcherType=none — disables the file watcher (unnecessary in prod)
+CMD ["streamlit", "run", "app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true", \
+     "--server.fileWatcherType=none"]
