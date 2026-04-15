@@ -448,84 +448,268 @@ def _select_model() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Inference helpers
+# Inference helpers — tokenizer utilities
 # ---------------------------------------------------------------------------
+
+# Safe chunk sizes: headroom below each model's hard position-embedding limit
+# to accommodate the special tokens (BOS, EOS, padding) that the pipeline
+# adds automatically around every input.
+BART_CHUNK_TOKENS: int = 900   # BART limit = 1024; 124-token headroom
+FLAN_CHUNK_TOKENS: int = 435   # FLAN-T5-base limit = 512; 77-token headroom
+
+
+def _encode(pipe: Pipeline, text: str) -> list[int]:
+    """
+    Encode `text` to a list of token IDs using the pipeline's tokenizer.
+    Special tokens (BOS/EOS) are excluded so the count reflects only the
+    content tokens — the pipeline re-adds them when it calls the model.
+    """
+    return list(pipe.tokenizer.encode(text, add_special_tokens=False))
+
+
+def _decode(pipe: Pipeline, token_ids: list[int]) -> str:
+    """Decode a list of token IDs back to a plain-text string."""
+    return str(pipe.tokenizer.decode(token_ids, skip_special_tokens=True))
+
+
+def _split_into_chunks(pipe: Pipeline, text: str, chunk_size: int) -> list[str]:
+    """
+    Split `text` into a list of non-overlapping chunks, each containing at
+    most `chunk_size` tokens as measured by the pipeline's tokenizer.
+
+    Splitting is done in token space (not word space) so each chunk is
+    guaranteed to be within the model's position-embedding limit regardless
+    of how densely the words tokenise.
+    """
+    token_ids = _encode(pipe, text)
+
+    # Fast path: the entire text already fits in one chunk
+    if len(token_ids) <= chunk_size:
+        return [text]
+
+    chunks: list[str] = []
+    for start in range(0, len(token_ids), chunk_size):
+        chunk_ids = token_ids[start: start + chunk_size]
+        chunks.append(_decode(pipe, chunk_ids))
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# Inference helpers — Map-Reduce summarisation
+# ---------------------------------------------------------------------------
+
+
+def _bart_single_pass(text: str, max_length: int = 200, min_length: int = 30) -> str:
+    """
+    Run one BART summarisation pass.  The caller is responsible for ensuring
+    `text` is within BART_CHUNK_TOKENS before calling this function.
+    """
+    output: list[dict[str, Any]] = _models["bart"](
+        text,
+        max_length=max_length,
+        min_length=min_length,
+        do_sample=False,
+    )
+    return str(output[0]["summary_text"])
+
+
+def _bart_map_reduce(text: str, depth: int = 0) -> str:
+    """
+    Summarise `text` using the Map-Reduce strategy to handle documents longer
+    than BART's 1024-token position-embedding limit.
+
+    Algorithm:
+      Base case  — document fits in one BART pass (≤ BART_CHUNK_TOKENS):
+                   call BART directly and return.
+
+      Map phase  — split the document into BART_CHUNK_TOKENS-sized chunks;
+                   summarise each chunk independently with BART.
+
+      Reduce phase — concatenate the mini-summaries and call _bart_map_reduce
+                     recursively.  The combined mini-summaries are much shorter
+                     than the original document, so recursion terminates quickly.
+
+    depth is an internal guard against infinite recursion in pathological cases
+    (e.g. a model that always generates near-max-length output).  At depth 3 the
+    input is hard-truncated and a single pass is forced.
+
+    Example for a 3 000-token document (chunk size 900):
+      Map:
+        Chunk 1 (tokens   1  900) → BART → Mini-summary 1 (~150 tokens)
+        Chunk 2 (tokens 901 1800) → BART → Mini-summary 2 (~150 tokens)
+        Chunk 3 (tokens 1801 2700)→ BART → Mini-summary 3 (~150 tokens)
+        Chunk 4 (tokens 2701 3000)→ BART → Mini-summary 4 (~100 tokens)
+      Reduce:
+        Combined mini-summaries (~550 tokens) → BART → Final summary
+    """
+    bart_pipe = _models["bart"]
+    token_ids = _encode(bart_pipe, text)
+
+    # Base case: document fits within one safe BART pass
+    if len(token_ids) <= BART_CHUNK_TOKENS:
+        return _bart_single_pass(text)
+
+    # Safety valve: at max recursion depth force a single truncated pass
+    if depth >= 3:
+        logger.warning(
+            "Map-Reduce hit max depth (%d); forcing single truncated pass "
+            "on %d tokens.",
+            depth,
+            len(token_ids),
+        )
+        safe_text = _decode(bart_pipe, token_ids[:BART_CHUNK_TOKENS])
+        return _bart_single_pass(safe_text)
+
+    chunks = _split_into_chunks(bart_pipe, text, BART_CHUNK_TOKENS)
+    logger.info(
+        "Map-Reduce BART (depth=%d): %d tokens → %d chunks of ≤%d tokens",
+        depth,
+        len(token_ids),
+        len(chunks),
+        BART_CHUNK_TOKENS,
+    )
+
+    # MAP: summarise each chunk independently; use shorter outputs so the
+    # combined reduce input stays well below BART_CHUNK_TOKENS.
+    mini_summaries: list[str] = []
+    for idx, chunk in enumerate(chunks):
+        logger.info("Map-Reduce BART: chunk %d/%d", idx + 1, len(chunks))
+        mini = _bart_single_pass(chunk, max_length=150, min_length=20)
+        mini_summaries.append(mini)
+
+    # REDUCE: join mini-summaries and recurse; the combined text is much
+    # shorter than the original so the next level almost always hits the
+    # base case.
+    combined = " ".join(mini_summaries)
+    logger.info(
+        "Map-Reduce BART (depth=%d): reduce pass — %d mini-summaries → "
+        "%d combined tokens",
+        depth,
+        len(mini_summaries),
+        len(_encode(bart_pipe, combined)),
+    )
+    return _bart_map_reduce(combined, depth=depth + 1)
+
+
+def _flan_map_reduce(text: str) -> str:
+    """
+    Summarise `text` using FLAN-T5 with a Map-Reduce strategy to handle
+    documents longer than FLAN-T5-base's 512-token limit.
+
+    Map  : split into FLAN_CHUNK_TOKENS-sized chunks; summarise each with a
+           short instruction prompt ("Summarize in 1-2 sentences: …").
+    Reduce: concatenate mini-summaries; if the combined text still exceeds
+           FLAN_CHUNK_TOKENS, truncate it before the final pass (FLAN-T5 is
+           less suited to deep recursion than BART because its outputs can be
+           verbose).
+    """
+    flan_pipe = _models["flan"]
+    token_ids = _encode(flan_pipe, text)
+
+    # Base case: fits in a single pass
+    if len(token_ids) <= FLAN_CHUNK_TOKENS:
+        prompt = (
+            "Summarize the following document in a few clear sentences:"
+            f"\n\n{text}"
+        )
+        output: list[dict[str, Any]] = flan_pipe(
+            prompt,
+            max_length=200,
+            min_length=20,
+            do_sample=False,
+        )
+        return str(output[0]["generated_text"])
+
+    chunks = _split_into_chunks(flan_pipe, text, FLAN_CHUNK_TOKENS)
+    logger.info(
+        "Map-Reduce FLAN (1 level): %d tokens → %d chunks of ≤%d tokens",
+        len(token_ids),
+        len(chunks),
+        FLAN_CHUNK_TOKENS,
+    )
+
+    # MAP: one short summary per chunk
+    mini_summaries: list[str] = []
+    for idx, chunk in enumerate(chunks):
+        logger.info("Map-Reduce FLAN: chunk %d/%d", idx + 1, len(chunks))
+        prompt = f"Summarize the following text in 1-2 sentences:\n\n{chunk}"
+        out: list[dict[str, Any]] = flan_pipe(
+            prompt,
+            max_length=100,
+            min_length=15,
+            do_sample=False,
+        )
+        mini_summaries.append(str(out[0]["generated_text"]))
+
+    # REDUCE: combine and run a final summarisation pass
+    combined = " ".join(mini_summaries)
+    combined_ids = _encode(flan_pipe, combined)
+
+    # If the combined mini-summaries are still too long, truncate them
+    if len(combined_ids) > FLAN_CHUNK_TOKENS:
+        combined = _decode(flan_pipe, combined_ids[:FLAN_CHUNK_TOKENS])
+
+    final_prompt = (
+        "Summarize the following document in a few clear sentences:"
+        f"\n\n{combined}"
+    )
+    final_out: list[dict[str, Any]] = flan_pipe(
+        final_prompt,
+        max_length=200,
+        min_length=20,
+        do_sample=False,
+    )
+    return str(final_out[0]["generated_text"])
 
 
 def _summarise(text: str, model_name: str) -> str:
     """
-    Generate a summary of the document text.
+    Entry point for document summarisation.
 
-    When model_name is "bart": uses the BART summarisation pipeline which
-        was fine-tuned specifically on CNN/DailyMail for extractive-abstractive
-        summarisation.
-    When model_name is "flan": uses FLAN-T5 with an instruction prompt,
-        leveraging its general instruction-following capability for summarisation.
-
-    Input text is truncated to the first 1 024 whitespace tokens before being
-    passed to either model to stay within input length constraints.
+    Routes to the correct Map-Reduce implementation based on the model
+    selected by the epsilon-greedy A/B router.  Both implementations handle
+    documents of arbitrary length by chunking, summarising each chunk, and
+    recursively (BART) or single-level (FLAN-T5) reducing the results.
     """
-    # Truncate to the first 1 024 words to stay within model input limits
-    truncated = " ".join(text.split()[:1024])
-
     if model_name == "bart":
-        bart_pipe = _models["bart"]
-        output: list[dict[str, Any]] = bart_pipe(
-            truncated,
-            max_length=256,
-            min_length=64,
-            do_sample=False,
-            truncation=True,
-        )
-        return str(output[0]["summary_text"])
+        return _bart_map_reduce(text)
+    return _flan_map_reduce(text)
 
-    # FLAN-T5 summarisation via instruction prompt
-    flan_pipe = _models["flan"]
-    prompt = f"Summarize the following document in a few clear sentences:\n\n{truncated}"
-    output = flan_pipe(
-        prompt,
-        max_length=256,
-        min_length=32,
-        do_sample=False,
-        truncation=True,
-    )
-    return str(output[0]["generated_text"])
+
+# ---------------------------------------------------------------------------
+# Inference helpers — question generation
+# ---------------------------------------------------------------------------
 
 
 def _generate_questions(text: str) -> list[str]:
     """
     Generate comprehension questions for the document using FLAN-T5.
 
-    The text is split into segments of approximately 80 words each (roughly
-    500 characters). One question is generated per segment; duplicates are
-    removed while preserving insertion order. A maximum of 5 segments are
-    processed to keep inference time practical on CPU.
+    The document is split into FLAN_CHUNK_TOKENS-sized chunks (token-accurate,
+    not word-approximate).  One question is generated per chunk; a maximum of
+    5 chunks are processed to keep inference time practical.  Duplicate
+    questions are removed while preserving insertion order.
     """
     flan_pipe = _models["flan"]
-    words = text.split()
 
-    # Build segments of ~80 words each; cap at 5 segments to bound latency
-    segment_size = 80
-    max_segments = 5
-    segments: list[str] = [
-        " ".join(words[i: i + segment_size])
-        for i in range(0, min(len(words), segment_size * max_segments), segment_size)
-        if words[i: i + segment_size]
-    ]
+    # Split using the same token-accurate chunking used by _flan_map_reduce
+    # so question coverage matches the summarisation coverage.
+    max_chunks = 5
+    all_chunks = _split_into_chunks(flan_pipe, text, FLAN_CHUNK_TOKENS)
+    chunks = all_chunks[:max_chunks]
 
     questions: list[str] = []
     seen: set[str] = set()
 
-    for segment in segments:
+    for chunk in chunks:
         prompt = (
-            "Generate a comprehension question based on the following text:\n\n"
-            f"{segment}"
+            "Generate a comprehension question based on the following text:"
+            f"\n\n{chunk}"
         )
         output: list[dict[str, Any]] = flan_pipe(
             prompt,
             max_length=128,
             do_sample=False,
-            truncation=True,
         )
         question = str(output[0]["generated_text"]).strip()
         if question and question not in seen:

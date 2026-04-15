@@ -52,11 +52,17 @@ services:
     networks:
       - ai_doc_net
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:5000/health || exit 1"]
+      # Use Python's built-in urllib instead of curl because curl is not
+      # installed in the python:3.11-slim base image used by the MLflow service.
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
       interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+      timeout: 10s
+      retries: 8
+      # MLflow runs many Alembic migrations on first start; allow 45 s before
+      # the first health check so the container is not marked unhealthy
+      # prematurely during database initialisation.
+      start_period: 45s
 
   # --------------------------------------------------------------------------
   # Backend API — GPU-accelerated inference with epsilon-greedy A/B routing
@@ -77,6 +83,8 @@ services:
       MODEL_FLAN: ${MODEL_FLAN:-google/flan-t5-base}
       MOCK_JWT_TOKEN: ${MOCK_JWT_TOKEN:-mock-jwt-token-for-academic-project}
       EPSILON: ${EPSILON:-0.1}
+      # Suppress the MLflow git-executable warning (git is not needed here)
+      GIT_PYTHON_REFRESH: quiet
       # HF_HOME is set in the Dockerfile to /hf_cache; this bind mount maps
       # that path to a persistent directory on the host.
       HF_HOME: /hf_cache
