@@ -42,7 +42,9 @@ import io
 import logging
 import os
 import tempfile
+import threading
 import time
+from collections import deque
 from typing import Any
 
 import mlflow
@@ -124,15 +126,31 @@ DRIFT_REFERENCE: dict[str, np.ndarray] = {
     ], dtype=float),
 }
 
-# Percentile bounds for the non-parametric outlier test
+# Percentile bounds for the point-anomaly test (per-request)
 DRIFT_PERCENTILE_LOW: float = 2.5
 DRIFT_PERCENTILE_HIGH: float = 97.5
 
-# Wasserstein distance thresholds expressed in each feature's own units
+# Wasserstein distance thresholds — compared against the rolling window, not a
+# single point. Expressed in each feature's own units.
 DRIFT_WASSERSTEIN_THRESHOLDS: dict[str, float] = {
     "word_count": 2000.0,          # raw word-count units
     "flesch_kincaid_grade": 5.0,   # grade-level units
 }
+
+# Rolling window: retain the last N observed feature values.
+# Wasserstein is only computed once the window contains at least
+# DRIFT_WINDOW_MIN_SAMPLES entries; before that only the point-anomaly
+# check runs.
+DRIFT_WINDOW_SIZE: int = 10
+DRIFT_WINDOW_MIN_SAMPLES: int = 5
+
+# Module-level stateful buffers — populated on every /process request.
+# A lock ensures safe concurrent access under Uvicorn's async workers.
+_drift_windows: dict[str, deque[float]] = {
+    "word_count": deque(maxlen=DRIFT_WINDOW_SIZE),
+    "flesch_kincaid_grade": deque(maxlen=DRIFT_WINDOW_SIZE),
+}
+_drift_window_lock: threading.Lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # FastAPI application instance
@@ -330,198 +348,211 @@ def _parse_document(file_bytes: bytes, filename: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _feature_drift(
-    feature: str,
-    value: float,
-) -> dict[str, float]:
+def _point_anomaly(feature: str, value: float) -> tuple[float, bool]:
     """
-    Run both non-parametric drift tests for a single feature value.
+    Point-anomaly test: locate a single value in the reference CDF.
 
-    Tests:
-      Percentile rank  — locates `value` in the empirical CDF of the reference
-                         population.  Values outside [DRIFT_PERCENTILE_LOW,
-                         DRIFT_PERCENTILE_HIGH] are statistical outliers.
-
-      Wasserstein distance — computes the Earth Mover's Distance between the
-                             single-point distribution at `value` and the full
-                             reference distribution.  This measures how much
-                             "work" is needed to transform the incoming signal
-                             into the baseline shape, without assuming normality.
+    Uses scipy.stats.percentileofscore — a non-parametric test that makes no
+    assumption about the shape of the underlying distribution.
 
     Returns:
-        {
-            "percentile":           float in [0, 100],
-            "wasserstein_distance": float >= 0,
-            "is_drift":             1.0 if either threshold is exceeded else 0.0,
-        }
+        (percentile_rank, is_anomaly) where is_anomaly is True when the value
+        falls outside [DRIFT_PERCENTILE_LOW, DRIFT_PERCENTILE_HIGH].
     """
-    reference = DRIFT_REFERENCE[feature]
+    pct = float(percentileofscore(DRIFT_REFERENCE[feature], value, kind="rank"))
+    is_anomaly = pct < DRIFT_PERCENTILE_LOW or pct > DRIFT_PERCENTILE_HIGH
+    return round(pct, 2), is_anomaly
 
-    pct: float = float(percentileofscore(reference, value, kind="rank"))
-    w_dist: float = float(wasserstein_distance([value], reference))
 
-    percentile_drift: bool = pct < DRIFT_PERCENTILE_LOW or pct > DRIFT_PERCENTILE_HIGH
-    wasserstein_drift: bool = w_dist > DRIFT_WASSERSTEIN_THRESHOLDS[feature]
+def _window_drift(feature: str, window: list[float]) -> tuple[float, bool]:
+    """
+    Distributional-drift test: compare a rolling window of live observations
+    against the reference population using the Wasserstein (Earth Mover's)
+    Distance.
 
-    return {
-        "percentile": round(pct, 2),
-        "wasserstein_distance": round(w_dist, 4),
-        "is_drift": 1.0 if (percentile_drift or wasserstein_drift) else 0.0,
-    }
+    wasserstein_distance(window, reference) measures the minimum "work" needed
+    to transform the live distribution into the reference shape.  Unlike the
+    single-point case, comparing two real distributions here produces a
+    statistically meaningful result — the metric rises when traffic
+    systematically shifts (e.g. users consistently uploading larger documents).
+
+    Returns:
+        (wasserstein_distance, is_drift) where is_drift is True when the
+        distance exceeds DRIFT_WASSERSTEIN_THRESHOLDS[feature].
+    """
+    w_dist = float(wasserstein_distance(window, DRIFT_REFERENCE[feature]))
+    is_drift = w_dist > DRIFT_WASSERSTEIN_THRESHOLDS[feature]
+    return round(w_dist, 4), is_drift
 
 
 def _detect_drift(text: str) -> dict[str, Any]:
     """
-    Assess whether the input document has drifted from the reference population.
+    Two-tier drift assessment for the incoming document.
 
-    Two features are extracted:
-      word_count           — total whitespace-delimited tokens.
-      flesch_kincaid_grade — readability grade level via textstat (higher = harder).
+    Tier 1 — Point anomaly (every request):
+        percentileofscore(reference, value) flags documents that are
+        outliers relative to the baseline CDF.  Catches a single abnormal
+        request immediately.
 
-    Each feature is tested independently with _feature_drift.  The document is
-    tagged drift_detected when at least one feature triggers either the
-    percentile-rank or the Wasserstein-distance threshold.
+    Tier 2 — Distributional drift (once window has >= DRIFT_WINDOW_MIN_SAMPLES):
+        wasserstein_distance(rolling_window, reference) detects systematic
+        shifts in the traffic profile over time.  Catches the case where
+        individual documents are within bounds but the overall population
+        is slowly moving — the mathematically correct use of Wasserstein.
 
-    Returns a flat dict of all feature values, test statistics, and drift_status
-    so every value can be logged directly to MLflow as a metric or tag.
+    drift_status encoding (logged as an MLflow tag):
+        "normal"                — neither test triggered.
+        "point_anomaly"         — this document is an outlier; window is fine.
+        "window_drift"          — rolling window has drifted; this document is normal.
+        "point_anomaly|window_drift" — both conditions are active simultaneously.
+
+    Returns a flat dict of all feature values and test statistics suitable for
+    direct logging to MLflow as metrics and tags.
     """
     word_count: int = len(text.split())
     fk_grade: float = textstat.flesch_kincaid_grade(text)
 
-    wc_result = _feature_drift("word_count", float(word_count))
-    fk_result = _feature_drift("flesch_kincaid_grade", fk_grade)
+    # --- Tier 1: point-anomaly test ---
+    wc_pct, wc_anomaly = _point_anomaly("word_count", float(word_count))
+    fk_pct, fk_anomaly = _point_anomaly("flesch_kincaid_grade", fk_grade)
+    is_point_anomaly: bool = wc_anomaly or fk_anomaly
 
-    is_drift: bool = bool(wc_result["is_drift"]) or bool(fk_result["is_drift"])
+    # --- Rolling window update (thread-safe) ---
+    with _drift_window_lock:
+        _drift_windows["word_count"].append(float(word_count))
+        _drift_windows["flesch_kincaid_grade"].append(fk_grade)
+        wc_window = list(_drift_windows["word_count"])
+        fk_window = list(_drift_windows["flesch_kincaid_grade"])
+
+    # --- Tier 2: distributional-drift test ---
+    wc_wass: float = 0.0
+    fk_wass: float = 0.0
+    is_window_drift: bool = False
+    window_size: int = len(wc_window)
+
+    if window_size >= DRIFT_WINDOW_MIN_SAMPLES:
+        wc_wass, wc_wdrift = _window_drift("word_count", wc_window)
+        fk_wass, fk_wdrift = _window_drift("flesch_kincaid_grade", fk_window)
+        is_window_drift = wc_wdrift or fk_wdrift
+
+    # --- Compose drift_status tag ---
+    flags: list[str] = []
+    if is_point_anomaly:
+        flags.append("point_anomaly")
+    if is_window_drift:
+        flags.append("window_drift")
+    drift_status: str = "|".join(flags) if flags else "normal"
+
+    logger.info(
+        "Drift — wc=%d (pct=%.1f anomaly=%s wass=%.1f) "
+        "fk=%.2f (pct=%.1f anomaly=%s wass=%.2f) "
+        "window=%d/%d status=%s",
+        word_count, wc_pct, wc_anomaly, wc_wass,
+        fk_grade, fk_pct, fk_anomaly, fk_wass,
+        window_size, DRIFT_WINDOW_SIZE, drift_status,
+    )
 
     return {
         "word_count": word_count,
         "flesch_kincaid_grade": round(fk_grade, 2),
-        "wc_percentile": wc_result["percentile"],
-        "wc_wasserstein": wc_result["wasserstein_distance"],
-        "fk_percentile": fk_result["percentile"],
-        "fk_wasserstein": fk_result["wasserstein_distance"],
-        "drift_status": "drift_detected" if is_drift else "normal",
+        "wc_percentile": wc_pct,
+        "fk_percentile": fk_pct,
+        "wc_wasserstein": wc_wass,
+        "fk_wasserstein": fk_wass,
+        "window_size": window_size,
+        "drift_status": drift_status,
     }
 
 
 # ---------------------------------------------------------------------------
-# Thompson Sampling A/B model router
+# Thompson Sampling A/B model router — in-memory state
 # ---------------------------------------------------------------------------
+#
+# State is kept entirely in memory and updated only when /feedback is called.
+# This eliminates an MLflow database read on every /process request, which
+# would otherwise become the dominant source of inference latency.
+#
+# Cold-start / crash safety: initialising with alpha=1, beta=1 (the uniform
+# Beta prior) means np.random.beta is always called with valid parameters
+# (both strictly > 0) even before any feedback has been collected.  A
+# Beta(1, 1) posterior represents complete uncertainty — both models are
+# equally likely to be selected until evidence accumulates.
 
-# Uniform Beta prior applied to every model with no feedback history yet.
-# Beta(1, 1) is equivalent to a uniform distribution over [0, 1], meaning
-# the algorithm has no initial preference between the two models.
-_BETA_PRIOR_ALPHA: int = 1
-_BETA_PRIOR_BETA: int = 1
+_thompson_state: dict[str, dict[str, int]] = {
+    "bart": {"alpha": 1, "beta": 1},
+    "flan": {"alpha": 1, "beta": 1},
+}
+
+# Protects _thompson_state and _run_model_map from concurrent writes under
+# Uvicorn's threaded workers.
+_thompson_lock: threading.Lock = threading.Lock()
+
+# Maps MLflow run_id → model short-name so the /feedback endpoint can update
+# the correct posterior without querying MLflow.  Capped at 2 000 entries to
+# bound memory usage on a long-running server.
+_run_model_map: dict[str, str] = {}
+_RUN_MAP_MAX: int = 2_000
 
 
-def _fetch_beta_params() -> dict[str, dict[str, int]]:
-    """
-    Query MLflow for the thumbs-up and thumbs-down counts per model and
-    return the corresponding Beta posterior parameters.
-
-    For each model:
-        alpha = thumbs_up_count  + _BETA_PRIOR_ALPHA
-        beta  = thumbs_down_count + _BETA_PRIOR_BETA
-
-    Falls back to the uniform prior (alpha=1, beta=1) for any model whose
-    history cannot be retrieved, so routing remains functional even when
-    MLflow is unavailable or the experiment has no feedback yet.
-
-    Returns:
-        {
-            "bart": {"alpha": int, "beta": int},
-            "flan": {"alpha": int, "beta": int},
-        }
-    """
-    prior: dict[str, dict[str, int]] = {
-        "bart": {"alpha": _BETA_PRIOR_ALPHA, "beta": _BETA_PRIOR_BETA},
-        "flan": {"alpha": _BETA_PRIOR_ALPHA, "beta": _BETA_PRIOR_BETA},
-    }
-
-    try:
-        client = mlflow.tracking.MlflowClient()
-        experiment = mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME)
-
-        if experiment is None:
-            logger.debug("Experiment not found yet; using Beta prior for both models.")
-            return prior
-
-        runs = client.search_runs(
-            experiment_ids=[experiment.experiment_id],
-            filter_string="metrics.user_satisfaction_score >= 0",
-            max_results=500,
-        )
-
-    except Exception as exc:
-        logger.warning(
-            "MLflow query failed — falling back to Beta prior for routing: %s", exc
-        )
-        return prior
-
-    counts: dict[str, dict[str, int]] = {
-        "bart": {"thumbs_up": 0, "thumbs_down": 0},
-        "flan": {"thumbs_up": 0, "thumbs_down": 0},
-    }
-
-    for run in runs:
-        model: str | None = run.data.params.get("model_name")
-        score: float | None = run.data.metrics.get("user_satisfaction_score")
-        if model in counts and score is not None:
-            if score >= 1.0:
-                counts[model]["thumbs_up"] += 1
-            else:
-                counts[model]["thumbs_down"] += 1
-
-    return {
-        model: {
-            "alpha": counts[model]["thumbs_up"] + _BETA_PRIOR_ALPHA,
-            "beta":  counts[model]["thumbs_down"] + _BETA_PRIOR_BETA,
-        }
-        for model in counts
-    }
+def _register_run(run_id: str, model: str) -> None:
+    """Store the run_id → model mapping; evict oldest entry when the cap is hit."""
+    with _thompson_lock:
+        if len(_run_model_map) >= _RUN_MAP_MAX:
+            # dict preserves insertion order in Python 3.7+; pop the oldest key
+            oldest = next(iter(_run_model_map))
+            del _run_model_map[oldest]
+        _run_model_map[run_id] = model
 
 
 def _select_model() -> str:
     """
-    Select a model using Thompson Sampling.
+    Select a model using Thompson Sampling against the in-memory Beta posteriors.
 
-    For each model a single value is drawn from its Beta posterior
-    Beta(alpha, beta). The model whose draw is higher wins the request.
-
-    This naturally balances exploration and exploitation:
-    - A model with few observations has a wide, flat posterior, so it
-      occasionally draws high values and receives exploratory traffic.
-    - A model with many observations has a narrow, peaked posterior centred
-      on its true success rate, so it wins consistently once its superiority
-      is established.
-    - Unlike epsilon-greedy, no fixed exploration rate is required and
-      cumulative regret is minimised asymptotically.
-
-    Returns:
-        "bart" or "flan"
+    One value is sampled from Beta(alpha, beta) for each model.  The model
+    with the higher draw wins the request.  No database query is made here —
+    the posteriors are updated lazily only when feedback arrives.
     """
-    params = _fetch_beta_params()
-
-    samples: dict[str, float] = {
-        model: float(np.random.beta(p["alpha"], p["beta"]))
-        for model, p in params.items()
-    }
+    with _thompson_lock:
+        samples: dict[str, float] = {
+            model: float(np.random.beta(state["alpha"], state["beta"]))
+            for model, state in _thompson_state.items()
+        }
 
     chosen: str = max(samples, key=lambda m: samples[m])
+
+    with _thompson_lock:
+        s = _thompson_state
 
     logger.info(
         "Thompson Sampling: selected '%s' "
         "(bart sample=%.4f α=%d β=%d | flan sample=%.4f α=%d β=%d)",
         chosen,
         samples["bart"],
-        params["bart"]["alpha"],
-        params["bart"]["beta"],
+        s["bart"]["alpha"], s["bart"]["beta"],
         samples["flan"],
-        params["flan"]["alpha"],
-        params["flan"]["beta"],
+        s["flan"]["alpha"], s["flan"]["beta"],
     )
     return chosen
+
+
+def _update_thompson(model: str, thumbs_up: bool) -> None:
+    """
+    Apply one feedback observation to the model's Beta posterior.
+
+    thumbs_up=True  → increment alpha (success count).
+    thumbs_up=False → increment beta  (failure count).
+    """
+    key = "alpha" if thumbs_up else "beta"
+    with _thompson_lock:
+        _thompson_state[model][key] += 1
+    logger.info(
+        "Thompson posterior updated — model='%s' %s "
+        "(α=%d β=%d)",
+        model,
+        "thumbs_up" if thumbs_up else "thumbs_down",
+        _thompson_state[model]["alpha"],
+        _thompson_state[model]["beta"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -872,18 +903,8 @@ async def process_document(
 
     # Step 2: Drift detection — runs before inference so the result can be
     # logged as a tag on the same MLflow run as the inference metrics.
+    # Logging is handled inside _detect_drift itself.
     drift_info: dict[str, Any] = _detect_drift(text)
-    logger.info(
-        "Drift check — word_count=%d  fk_grade=%.2f  "
-        "wc_pct=%.1f  wc_wass=%.2f  fk_pct=%.1f  fk_wass=%.2f  status=%s",
-        drift_info["word_count"],
-        drift_info["flesch_kincaid_grade"],
-        drift_info["wc_percentile"],
-        drift_info["wc_wasserstein"],
-        drift_info["fk_percentile"],
-        drift_info["fk_wasserstein"],
-        drift_info["drift_status"],
-    )
 
     # Step 3: Model selection
     selected_model: str = _select_model()
@@ -932,9 +953,10 @@ async def process_document(
             "word_count": float(drift_info["word_count"]),
             "flesch_kincaid_grade": drift_info["flesch_kincaid_grade"],
             "wc_percentile": drift_info["wc_percentile"],
-            "wc_wasserstein": drift_info["wc_wasserstein"],
             "fk_percentile": drift_info["fk_percentile"],
+            "wc_wasserstein": drift_info["wc_wasserstein"],
             "fk_wasserstein": drift_info["fk_wasserstein"],
+            "drift_window_size": float(drift_info["window_size"]),
         })
 
         # Tags: categorical metadata for filtering in the MLflow UI
@@ -965,6 +987,10 @@ async def process_document(
 
         mlflow.log_artifact(tmp_path, artifact_path="results")
 
+    # Register the run→model mapping so /feedback can update the correct
+    # Thompson posterior without querying MLflow.
+    _register_run(run_id, selected_model)
+
     logger.info(
         "Inference complete — run_id=%s  model=%s  latency=%.3fs  drift=%s",
         run_id,
@@ -991,9 +1017,12 @@ async def submit_feedback(
     """
     Record the user's satisfaction score for a completed inference run.
 
-    Resumes the MLflow run identified by run_id and appends the
-    user_satisfaction_score metric. The epsilon-greedy router reads these
-    scores on subsequent requests to decide which model to exploit.
+    Two actions are performed:
+      1. MLflow — resumes the run by run_id and appends user_satisfaction_score
+         for permanent audit and dashboard visibility.
+      2. In-memory — updates the Thompson Sampling Beta posterior for the model
+         that served this run, so the next routing decision is immediately
+         informed by the feedback without any database read.
 
     score values:
         1 — thumbs-up  (the result was helpful)
@@ -1007,9 +1036,8 @@ async def submit_feedback(
             detail="score must be 0 (thumbs-down) or 1 (thumbs-up).",
         )
 
+    # Persist to MLflow for dashboards and long-term audit trail
     try:
-        # mlflow.start_run with an existing run_id resumes that run rather
-        # than creating a new one, allowing metrics to be appended.
         with mlflow.start_run(run_id=body.run_id):
             mlflow.log_metric("user_satisfaction_score", float(body.score))
     except Exception as exc:
@@ -1020,8 +1048,25 @@ async def submit_feedback(
             ),
         ) from exc
 
+    # Update the in-memory Thompson posterior — no MLflow read required
+    with _thompson_lock:
+        model = _run_model_map.get(body.run_id)
+
+    if model and model in _thompson_state:
+        _update_thompson(model, thumbs_up=body.score == 1)
+    else:
+        logger.warning(
+            "Feedback for run_id=%s: model not found in run map "
+            "(server may have restarted); MLflow record saved but "
+            "in-memory posterior not updated.",
+            body.run_id,
+        )
+
     logger.info(
-        "Feedback recorded — run_id=%s  score=%d", body.run_id, body.score
+        "Feedback recorded — run_id=%s  model=%s  score=%d",
+        body.run_id,
+        model or "unknown",
+        body.score,
     )
 
     return FeedbackResponse(

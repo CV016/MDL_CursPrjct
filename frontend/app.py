@@ -189,25 +189,40 @@ if "result" in st.session_state:
 
     with col_drift:
         drift_raw: str = result.get("drift_status", "normal")
-        drift_label: str = (
-            "Drift Detected" if drift_raw == "drift_detected" else "Normal"
-        )
+
+        # Map the compound status tag to a concise display label
+        _drift_labels: dict[str, str] = {
+            "normal": "Normal",
+            "point_anomaly": "Point Anomaly",
+            "window_drift": "Window Drift",
+            "point_anomaly|window_drift": "Anomaly + Drift",
+        }
+        drift_label: str = _drift_labels.get(drift_raw, drift_raw.replace("|", " + "))
+
         st.metric(
             label="Data Drift",
             value=drift_label,
             help=(
-                "Z-score drift detection based on word count and "
-                "Flesch-Kincaid Grade Level vs. a hardcoded baseline. "
-                "Drift is flagged when |Z| > 3.0 for either feature."
+                "Two-tier non-parametric drift detection. "
+                "Point Anomaly: this document's percentile rank is outside the "
+                "[2.5, 97.5] interval of the reference CDF. "
+                "Window Drift: the Wasserstein distance between the last "
+                "10 requests and the reference distribution exceeds the threshold."
             ),
         )
 
-    # Drift warning banner — draw attention when an anomaly is detected
-    if drift_raw == "drift_detected":
+    # Drift warning banners — separate messages for each tier
+    if "point_anomaly" in drift_raw:
         st.warning(
-            "Data drift detected in the uploaded document. "
-            "The document's statistical features differ significantly from "
-            "the baseline corpus. Results may be less reliable."
+            "Point anomaly detected: this document's features fall outside the "
+            "expected range of the reference population. "
+            "It may be unusually long, short, or at an atypical reading level."
+        )
+    if "window_drift" in drift_raw:
+        st.error(
+            "Distributional drift detected: the recent batch of uploaded documents "
+            "has systematically shifted away from the baseline distribution. "
+            "Model performance may be degraded for the current traffic pattern."
         )
 
     st.divider()
