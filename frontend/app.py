@@ -207,8 +207,7 @@ if "result" in st.session_state:
         st.warning(
             "Data drift detected in the uploaded document. "
             "The document's statistical features differ significantly from "
-            "the baseline corpus. Results may be less reliable.",
-            icon="warning",
+            "the baseline corpus. Results may be less reliable."
         )
 
     st.divider()
