@@ -10,9 +10,10 @@ the academic MLOps pipeline:
   - Z-score data drift detection: word count and Flesch-Kincaid Grade Level
     (computed with textstat) are compared against a hardcoded statistical
     baseline. Any feature whose |Z-score| exceeds the threshold is flagged.
-  - Epsilon-greedy A/B model routing: queries MLflow for the historical
-    thumbs-up ratio of each model and exploits the winner 90% of the time;
-    explores randomly the remaining 10%.
+  - Thompson Sampling A/B model routing: maintains a Beta(alpha, beta)
+    posterior per model from MLflow feedback history; samples from each
+    posterior and routes to the model whose sample is higher. Exploration
+    and exploitation are balanced automatically — no fixed epsilon required.
   - Inference: facebook/bart-large-cnn for summarisation; google/flan-t5-base
     for question generation. Both models are loaded once at startup.
   - MLflow experiment tracking: each /process call opens a new run, logs
@@ -39,13 +40,13 @@ from __future__ import annotations
 import io
 import logging
 import os
-import random
 import tempfile
 import time
 from typing import Any
 
 import mlflow
 import mlflow.tracking
+import numpy as np
 import textstat
 import torch
 from docx import Document as DocxDocument
@@ -88,9 +89,6 @@ MODEL_FLAN: str = os.environ.get("MODEL_FLAN", "google/flan-t5-base")
 MOCK_JWT_TOKEN: str = os.environ.get(
     "MOCK_JWT_TOKEN", "mock-jwt-token-for-academic-project"
 )
-
-# Epsilon-greedy exploration probability (0.1 = 10% random exploration)
-EPSILON: float = float(os.environ.get("EPSILON", "0.1"))
 
 # ---------------------------------------------------------------------------
 # Drift detection — hardcoded baseline statistics
@@ -360,33 +358,48 @@ def _detect_drift(text: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Epsilon-greedy A/B model router
+# Thompson Sampling A/B model router
 # ---------------------------------------------------------------------------
 
+# Uniform Beta prior applied to every model with no feedback history yet.
+# Beta(1, 1) is equivalent to a uniform distribution over [0, 1], meaning
+# the algorithm has no initial preference between the two models.
+_BETA_PRIOR_ALPHA: int = 1
+_BETA_PRIOR_BETA: int = 1
 
-def _fetch_model_satisfaction_rates() -> dict[str, float]:
+
+def _fetch_beta_params() -> dict[str, dict[str, int]]:
     """
-    Query MLflow for the historical mean user_satisfaction_score per model.
+    Query MLflow for the thumbs-up and thumbs-down counts per model and
+    return the corresponding Beta posterior parameters.
 
-    Searches all runs in the current experiment that have a logged
-    user_satisfaction_score metric and groups the scores by the model_name
-    parameter. Falls back to 0.5 for any model with no history, which
-    represents a neutral prior and gives both models equal initial weight.
+    For each model:
+        alpha = thumbs_up_count  + _BETA_PRIOR_ALPHA
+        beta  = thumbs_down_count + _BETA_PRIOR_BETA
+
+    Falls back to the uniform prior (alpha=1, beta=1) for any model whose
+    history cannot be retrieved, so routing remains functional even when
+    MLflow is unavailable or the experiment has no feedback yet.
 
     Returns:
-        {"bart": <float>, "flan": <float>} with values in [0.0, 1.0].
+        {
+            "bart": {"alpha": int, "beta": int},
+            "flan": {"alpha": int, "beta": int},
+        }
     """
-    default_rates: dict[str, float] = {"bart": 0.5, "flan": 0.5}
+    prior: dict[str, dict[str, int]] = {
+        "bart": {"alpha": _BETA_PRIOR_ALPHA, "beta": _BETA_PRIOR_BETA},
+        "flan": {"alpha": _BETA_PRIOR_ALPHA, "beta": _BETA_PRIOR_BETA},
+    }
 
     try:
         client = mlflow.tracking.MlflowClient()
         experiment = mlflow.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME)
 
         if experiment is None:
-            logger.debug("Experiment not found yet; using default satisfaction rates.")
-            return default_rates
+            logger.debug("Experiment not found yet; using Beta prior for both models.")
+            return prior
 
-        # Retrieve the most recent 500 runs that have a satisfaction score
         runs = client.search_runs(
             experiment_ids=[experiment.experiment_id],
             filter_string="metrics.user_satisfaction_score >= 0",
@@ -394,55 +407,72 @@ def _fetch_model_satisfaction_rates() -> dict[str, float]:
         )
 
     except Exception as exc:
-        # Network or MLflow server errors must not crash the routing logic;
-        # fall back to the neutral prior so inference continues uninterrupted.
         logger.warning(
-            "MLflow query failed — defaulting to equal satisfaction rates: %s", exc
+            "MLflow query failed — falling back to Beta prior for routing: %s", exc
         )
-        return default_rates
+        return prior
 
-    scores: dict[str, list[float]] = {"bart": [], "flan": []}
+    counts: dict[str, dict[str, int]] = {
+        "bart": {"thumbs_up": 0, "thumbs_down": 0},
+        "flan": {"thumbs_up": 0, "thumbs_down": 0},
+    }
 
     for run in runs:
-        model_name: str | None = run.data.params.get("model_name")
+        model: str | None = run.data.params.get("model_name")
         score: float | None = run.data.metrics.get("user_satisfaction_score")
-        if model_name in scores and score is not None:
-            scores[model_name].append(score)
+        if model in counts and score is not None:
+            if score >= 1.0:
+                counts[model]["thumbs_up"] += 1
+            else:
+                counts[model]["thumbs_down"] += 1
 
     return {
-        model: (sum(vals) / len(vals)) if vals else 0.5
-        for model, vals in scores.items()
+        model: {
+            "alpha": counts[model]["thumbs_up"] + _BETA_PRIOR_ALPHA,
+            "beta":  counts[model]["thumbs_down"] + _BETA_PRIOR_BETA,
+        }
+        for model in counts
     }
 
 
 def _select_model() -> str:
     """
-    Choose a model using the epsilon-greedy strategy.
+    Select a model using Thompson Sampling.
 
-    Exploration (probability = EPSILON):
-        Pick a model uniformly at random. This ensures that the less-favoured
-        model still receives traffic and can accumulate fresh feedback.
+    For each model a single value is drawn from its Beta posterior
+    Beta(alpha, beta). The model whose draw is higher wins the request.
 
-    Exploitation (probability = 1 - EPSILON):
-        Pick the model with the highest historical mean satisfaction rate from
-        MLflow. This directs most traffic to the currently best-performing model.
+    This naturally balances exploration and exploitation:
+    - A model with few observations has a wide, flat posterior, so it
+      occasionally draws high values and receives exploratory traffic.
+    - A model with many observations has a narrow, peaked posterior centred
+      on its true success rate, so it wins consistently once its superiority
+      is established.
+    - Unlike epsilon-greedy, no fixed exploration rate is required and
+      cumulative regret is minimised asymptotically.
 
     Returns:
         "bart" or "flan"
     """
-    if random.random() < EPSILON:
-        chosen: str = random.choice(["bart", "flan"])
-        logger.info("A/B router: EXPLORE — randomly selected '%s'", chosen)
-        return chosen
+    params = _fetch_beta_params()
 
-    rates = _fetch_model_satisfaction_rates()
-    chosen = max(rates, key=lambda m: rates[m])
+    samples: dict[str, float] = {
+        model: float(np.random.beta(p["alpha"], p["beta"]))
+        for model, p in params.items()
+    }
+
+    chosen: str = max(samples, key=lambda m: samples[m])
+
     logger.info(
-        "A/B router: EXPLOIT — selected '%s' "
-        "(bart satisfaction=%.3f, flan satisfaction=%.3f)",
+        "Thompson Sampling: selected '%s' "
+        "(bart sample=%.4f α=%d β=%d | flan sample=%.4f α=%d β=%d)",
         chosen,
-        rates.get("bart", 0.5),
-        rates.get("flan", 0.5),
+        samples["bart"],
+        params["bart"]["alpha"],
+        params["bart"]["beta"],
+        samples["flan"],
+        params["flan"]["alpha"],
+        params["flan"]["beta"],
     )
     return chosen
 

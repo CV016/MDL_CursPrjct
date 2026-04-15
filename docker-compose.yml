@@ -82,7 +82,6 @@ services:
       MODEL_BART: ${MODEL_BART:-facebook/bart-large-cnn}
       MODEL_FLAN: ${MODEL_FLAN:-google/flan-t5-base}
       MOCK_JWT_TOKEN: ${MOCK_JWT_TOKEN:-mock-jwt-token-for-academic-project}
-      EPSILON: ${EPSILON:-0.1}
       # Suppress the MLflow git-executable warning (git is not needed here)
       GIT_PYTHON_REFRESH: quiet
       # HF_HOME is set in the Dockerfile to /hf_cache; this bind mount maps
