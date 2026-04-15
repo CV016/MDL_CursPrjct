@@ -122,6 +122,8 @@ services:
       BACKEND_URL: http://backend-api:8000
       MOCK_JWT_TOKEN: ${MOCK_JWT_TOKEN:-mock-jwt-token-for-academic-project}
     ports:
-      - "8501:8501"
+      # Host port 9501 matches the SSH tunnel (-L 9501:localhost:9501).
+      # The container still runs Streamlit on its internal port 8501.
+      - "9501:8501"
     networks:
       - ai_doc_net
