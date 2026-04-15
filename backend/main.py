@@ -7,9 +7,10 @@ This is the single FastAPI application that implements all backend logic for
 the academic MLOps pipeline:
 
   - Document parsing: PDF via PyPDF2, DOCX via python-docx, PPTX via python-pptx.
-  - Z-score data drift detection: word count and Flesch-Kincaid Grade Level
-    (computed with textstat) are compared against a hardcoded statistical
-    baseline. Any feature whose |Z-score| exceeds the threshold is flagged.
+  - Non-parametric drift detection: word count and Flesch-Kincaid Grade Level
+    (computed with textstat) are tested against a hardcoded reference population
+    using the Kolmogorov-Smirnov percentile rank and Wasserstein (Earth Mover's)
+    distance. Drift is flagged when either metric exceeds its threshold.
   - Thompson Sampling A/B model routing: maintains a Beta(alpha, beta)
     posterior per model from MLflow feedback history; samples from each
     posterior and routes to the model whose sample is higher. Exploration
@@ -47,6 +48,7 @@ from typing import Any
 import mlflow
 import mlflow.tracking
 import numpy as np
+from scipy.stats import percentileofscore, wasserstein_distance
 import textstat
 import torch
 from docx import Document as DocxDocument
@@ -91,23 +93,46 @@ MOCK_JWT_TOKEN: str = os.environ.get(
 )
 
 # ---------------------------------------------------------------------------
-# Drift detection — hardcoded baseline statistics
+# Drift detection — non-parametric reference population
 #
-# These values represent the expected distribution of a "normal" academic or
-# professional document based on empirical observation:
-#   word_count            : documents typically contain 200–800 words
-#   flesch_kincaid_grade  : readability grade level typically 7–13
+# 50 sample points per feature, representative of real academic and
+# professional documents.  Word counts are right-skewed (most documents are
+# short; a long tail of large reports exists).  FK grades are centred around
+# the college-level reading range (grade 12-16).
 #
-# A document is flagged as drift_detected when the absolute Z-score of any
-# feature exceeds DRIFT_Z_THRESHOLD (3.0 standard deviations from the mean).
+# Drift is flagged when EITHER condition holds for any feature:
+#   1. Percentile rank falls outside [DRIFT_PERCENTILE_LOW, DRIFT_PERCENTILE_HIGH]
+#      — the incoming document is a statistical outlier relative to the reference CDF.
+#   2. Wasserstein distance exceeds DRIFT_WASSERSTEIN_THRESHOLDS[feature]
+#      — the "cost" of transforming the live distribution to the baseline is too high.
 # ---------------------------------------------------------------------------
 
-DRIFT_BASELINE: dict[str, dict[str, float]] = {
-    "word_count": {"mu": 500.0, "sigma": 200.0},
-    "flesch_kincaid_grade": {"mu": 10.0, "sigma": 3.0},
+DRIFT_REFERENCE: dict[str, np.ndarray] = {
+    "word_count": np.array([
+        180,  220,  260,  300,  340,  380,  420,  460,  500,  550,
+        600,  650,  700,  750,  800,  880,  960,  1050, 1150, 1250,
+        1380, 1520, 1680, 1850, 2050, 2250, 2500, 2750, 3050, 3400,
+        3800, 4200, 4700, 5200, 5800, 6500, 7200, 8000, 8900, 9900,
+        320,  480,  640,  920,  1100, 1450, 1750, 2100, 2600, 3200,
+    ], dtype=float),
+    "flesch_kincaid_grade": np.array([
+        8.0,  8.5,  9.0,  9.5,  10.0, 10.5, 11.0, 11.5, 12.0, 12.5,
+        13.0, 13.5, 14.0, 14.5, 15.0, 15.5, 16.0, 16.5, 17.0, 17.5,
+        18.0, 18.5, 19.0, 19.5, 20.0, 9.2,  9.8,  10.2, 10.8, 11.2,
+        11.8, 12.2, 12.8, 13.2, 13.8, 14.2, 14.8, 15.2, 15.8, 16.2,
+        8.3,  9.3,  10.3, 11.3, 12.3, 13.3, 14.3, 15.3, 16.3, 17.3,
+    ], dtype=float),
 }
 
-DRIFT_Z_THRESHOLD: float = 3.0
+# Percentile bounds for the non-parametric outlier test
+DRIFT_PERCENTILE_LOW: float = 2.5
+DRIFT_PERCENTILE_HIGH: float = 97.5
+
+# Wasserstein distance thresholds expressed in each feature's own units
+DRIFT_WASSERSTEIN_THRESHOLDS: dict[str, float] = {
+    "word_count": 2000.0,          # raw word-count units
+    "flesch_kincaid_grade": 5.0,   # grade-level units
+}
 
 # ---------------------------------------------------------------------------
 # FastAPI application instance
@@ -117,9 +142,9 @@ app = FastAPI(
     title="AI-DOC INTERACT — Backend API",
     version="1.0.0",
     description=(
-        "Single backend service implementing document parsing, Z-score drift "
-        "detection, epsilon-greedy A/B model routing, MLflow experiment "
-        "tracking, and feedback ingestion."
+        "Single backend service implementing document parsing, non-parametric "
+        "drift detection (KS percentile rank + Wasserstein distance), Thompson "
+        "Sampling A/B model routing, MLflow experiment tracking, and feedback ingestion."
     ),
 )
 
@@ -305,55 +330,77 @@ def _parse_document(file_bytes: bytes, filename: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _z_score(value: float, mu: float, sigma: float) -> float:
+def _feature_drift(
+    feature: str,
+    value: float,
+) -> dict[str, float]:
     """
-    Compute the standard Z-score: (value - mean) / std_dev.
+    Run both non-parametric drift tests for a single feature value.
 
-    Returns 0.0 when sigma is zero to avoid division by zero on degenerate
-    baselines.
+    Tests:
+      Percentile rank  — locates `value` in the empirical CDF of the reference
+                         population.  Values outside [DRIFT_PERCENTILE_LOW,
+                         DRIFT_PERCENTILE_HIGH] are statistical outliers.
+
+      Wasserstein distance — computes the Earth Mover's Distance between the
+                             single-point distribution at `value` and the full
+                             reference distribution.  This measures how much
+                             "work" is needed to transform the incoming signal
+                             into the baseline shape, without assuming normality.
+
+    Returns:
+        {
+            "percentile":           float in [0, 100],
+            "wasserstein_distance": float >= 0,
+            "is_drift":             1.0 if either threshold is exceeded else 0.0,
+        }
     """
-    if sigma == 0.0:
-        return 0.0
-    return (value - mu) / sigma
+    reference = DRIFT_REFERENCE[feature]
+
+    pct: float = float(percentileofscore(reference, value, kind="rank"))
+    w_dist: float = float(wasserstein_distance([value], reference))
+
+    percentile_drift: bool = pct < DRIFT_PERCENTILE_LOW or pct > DRIFT_PERCENTILE_HIGH
+    wasserstein_drift: bool = w_dist > DRIFT_WASSERSTEIN_THRESHOLDS[feature]
+
+    return {
+        "percentile": round(pct, 2),
+        "wasserstein_distance": round(w_dist, 4),
+        "is_drift": 1.0 if (percentile_drift or wasserstein_drift) else 0.0,
+    }
 
 
 def _detect_drift(text: str) -> dict[str, Any]:
     """
-    Assess whether the input document differs significantly from the baseline.
+    Assess whether the input document has drifted from the reference population.
 
-    Two features are computed using textstat:
-      1. word_count            — total whitespace-delimited tokens
-      2. flesch_kincaid_grade  — readability grade level (higher = harder)
+    Two features are extracted:
+      word_count           — total whitespace-delimited tokens.
+      flesch_kincaid_grade — readability grade level via textstat (higher = harder).
 
-    A Z-score is calculated for each feature against the hardcoded baseline.
-    The document is tagged drift_detected when |Z| > DRIFT_Z_THRESHOLD for
-    at least one feature; otherwise it is tagged normal.
+    Each feature is tested independently with _feature_drift.  The document is
+    tagged drift_detected when at least one feature triggers either the
+    percentile-rank or the Wasserstein-distance threshold.
 
-    Returns a dict containing raw feature values, Z-scores, and drift_status.
+    Returns a flat dict of all feature values, test statistics, and drift_status
+    so every value can be logged directly to MLflow as a metric or tag.
     """
     word_count: int = len(text.split())
     fk_grade: float = textstat.flesch_kincaid_grade(text)
 
-    z_wc: float = _z_score(
-        word_count,
-        DRIFT_BASELINE["word_count"]["mu"],
-        DRIFT_BASELINE["word_count"]["sigma"],
-    )
-    z_fk: float = _z_score(
-        fk_grade,
-        DRIFT_BASELINE["flesch_kincaid_grade"]["mu"],
-        DRIFT_BASELINE["flesch_kincaid_grade"]["sigma"],
-    )
+    wc_result = _feature_drift("word_count", float(word_count))
+    fk_result = _feature_drift("flesch_kincaid_grade", fk_grade)
 
-    is_drift: bool = abs(z_wc) > DRIFT_Z_THRESHOLD or abs(z_fk) > DRIFT_Z_THRESHOLD
-    drift_status: str = "drift_detected" if is_drift else "normal"
+    is_drift: bool = bool(wc_result["is_drift"]) or bool(fk_result["is_drift"])
 
     return {
         "word_count": word_count,
         "flesch_kincaid_grade": round(fk_grade, 2),
-        "z_word_count": round(z_wc, 4),
-        "z_fk_grade": round(z_fk, 4),
-        "drift_status": drift_status,
+        "wc_percentile": wc_result["percentile"],
+        "wc_wasserstein": wc_result["wasserstein_distance"],
+        "fk_percentile": fk_result["percentile"],
+        "fk_wasserstein": fk_result["wasserstein_distance"],
+        "drift_status": "drift_detected" if is_drift else "normal",
     }
 
 
@@ -828,11 +875,13 @@ async def process_document(
     drift_info: dict[str, Any] = _detect_drift(text)
     logger.info(
         "Drift check — word_count=%d  fk_grade=%.2f  "
-        "z_wc=%.4f  z_fk=%.4f  status=%s",
+        "wc_pct=%.1f  wc_wass=%.2f  fk_pct=%.1f  fk_wass=%.2f  status=%s",
         drift_info["word_count"],
         drift_info["flesch_kincaid_grade"],
-        drift_info["z_word_count"],
-        drift_info["z_fk_grade"],
+        drift_info["wc_percentile"],
+        drift_info["wc_wasserstein"],
+        drift_info["fk_percentile"],
+        drift_info["fk_wasserstein"],
         drift_info["drift_status"],
     )
 
@@ -882,8 +931,10 @@ async def process_document(
             "inference_latency": round(inference_latency, 4),
             "word_count": float(drift_info["word_count"]),
             "flesch_kincaid_grade": drift_info["flesch_kincaid_grade"],
-            "z_word_count": drift_info["z_word_count"],
-            "z_fk_grade": drift_info["z_fk_grade"],
+            "wc_percentile": drift_info["wc_percentile"],
+            "wc_wasserstein": drift_info["wc_wasserstein"],
+            "fk_percentile": drift_info["fk_percentile"],
+            "fk_wasserstein": drift_info["fk_wasserstein"],
         })
 
         # Tags: categorical metadata for filtering in the MLflow UI

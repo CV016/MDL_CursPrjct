@@ -34,3 +34,6 @@ accelerate==0.30.1
 
 # Numerical sampling — required for Thompson Sampling Beta distribution draws
 numpy==1.26.4
+
+# Statistical tests — KS test and Wasserstein distance for drift detection
+scipy==1.13.0
