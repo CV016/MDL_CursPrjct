@@ -1,434 +1,167 @@
 ================================================================================
-AI-DOC INTERACT — LOCAL DEVELOPMENT AND DOCKER RUN GUIDE
+AI-DOC INTERACT — Setup & Run Guide
 ================================================================================
 
-This document explains everything you need to run the project:
-  - Whether CPU is sufficient (yes, fully)
-  - How MLflow works (no registration, fully self-hosted)
-  - How to run locally without Docker (fastest for development and testing)
-  - How to run the full stack with Docker Compose
+SERVER DETAILS
+--------------
+Host : 172.25.1.12
+User : b22bb016
+Login: SSH with your university password
+
 
 --------------------------------------------------------------------------------
-TABLE OF CONTENTS
+STEP 1 — Connect to the server with port forwarding
 --------------------------------------------------------------------------------
 
-  1.  CPU vs GPU — What You Need
-  2.  How MLflow Works (No Registration Required)
-  3.  Prerequisites
-  4.  Running Locally Without Docker (Recommended for Development)
-       4.1  Create the virtual environment
-       4.2  Install PyTorch (CPU build)
-       4.3  Install all other backend dependencies
-       4.4  Start MLflow server (Terminal 1)
-       4.5  Start the backend API (Terminal 2)
-       4.6  Start the Streamlit frontend (Terminal 3)
-       4.7  Use the application
-  5.  Running the Test Suite Locally
-  6.  Running the Full Stack with Docker Compose
-  7.  Service URLs Reference
-  8.  Model Download Note (First Run)
-  9.  Troubleshooting
+Run this command in your local terminal (Windows PowerShell or Mac/Linux shell).
+Keep this terminal open the entire time you are using the app.
 
-================================================================================
-1. CPU vs GPU — WHAT YOU NEED
-================================================================================
+    ssh -L 9501:localhost:9501 -L 8000:localhost:8000 -L 5000:localhost:5000 b22bb016@172.25.1.12
 
-YES — the application runs entirely on CPU.  No GPU is required.
+What this does:
+    localhost:9501  ->  Streamlit UI
+    localhost:8000  ->  FastAPI backend  (Swagger docs at /docs)
+    localhost:5000  ->  MLflow UI
 
-GPU is not configured anywhere in docker-compose.yml (no nvidia runtime
-reservations).  The backend code detects the device automatically:
+Once connected you are inside the server. All commands below are run there.
 
-  _device = "cuda" if torch.cuda.is_available() else "cpu"
-
-On a machine without a CUDA GPU, _device will always be "cpu" and all
-inference runs on the processor.
-
-Performance expectations on CPU:
-  - facebook/bart-large-cnn (summarisation):  20 – 90 seconds per document
-  - google/flan-t5-base     (questions):       5 – 30 seconds per document
-  - Total wall-clock time per request:        30 – 120 seconds on a modern CPU
-
-If you have an NVIDIA GPU with CUDA drivers installed, the code will
-automatically use it and inference will be 5-10x faster.  No code changes
-are required — just ensure the CUDA toolkit is installed on the host.
-
-================================================================================
-2. HOW MLFLOW WORKS (NO REGISTRATION REQUIRED)
-================================================================================
-
-MLflow in this project is COMPLETELY SELF-HOSTED.  You do NOT need to:
-  - Create an account on mlflow.org
-  - Pay for any service
-  - Connect to any external server
-
-What MLflow does here:
-  - Runs as a local server process (or Docker container)
-  - Stores all experiment data in a local SQLite file (mlflow.db)
-  - Stores all artifacts (generated text files) in a local directory (mlruns/)
-  - Provides a web UI at http://localhost:5000 to browse results
-
-Everything lives on your machine.  If you delete mlflow.db and mlruns/, all
-experiment history is gone.  There are no external dependencies.
-
-Data stored per inference request:
-  Parameters : model_name, document_length, filename
-  Metrics    : inference_latency, word_count, flesch_kincaid_grade,
-               z_word_count, z_fk_grade
-  Tags       : drift_status, file_type
-  Artifact   : a .txt file containing the generated summary and questions
-
-When the user clicks thumbs-up or thumbs-down, the run is resumed and
-user_satisfaction_score (1 or 0) is appended to the same run.
-
-================================================================================
-3. PREREQUISITES
-================================================================================
-
-Required:
-  a) Python 3.11
-       https://www.python.org/downloads/
-       Verify: python --version   (must show 3.11.x)
-
-  b) pip (comes with Python)
-       Verify: pip --version
-
-Optional (only needed for Docker Compose):
-  c) Docker Desktop
-       https://www.docker.com/products/docker-desktop/
-       Verify: docker compose version
-
-You do NOT need Node.js, PostgreSQL, Redis, or any cloud credentials.
-
-================================================================================
-4. RUNNING LOCALLY WITHOUT DOCKER (RECOMMENDED FOR DEVELOPMENT)
-================================================================================
-
-Open THREE separate terminal windows.  All commands below assume you are in the
-repository root directory (F:\MDLOpsCourseProject\ai-doc-interact).
 
 --------------------------------------------------------------------------------
-4.1  CREATE THE VIRTUAL ENVIRONMENT
+STEP 2 — Find the project folder
 --------------------------------------------------------------------------------
 
-  Windows (PowerShell):
-    python -m venv .venv
-    .venv\Scripts\Activate.ps1
+The project lives directly in the home directory, not in a subfolder.
 
-  Linux / macOS:
-    python -m venv .venv
-    source .venv/bin/activate
+    cd ~
+    ls
 
-You should see (.venv) at the start of your terminal prompt.
+You should see docker-compose.yml and folders like backend/, frontend/, mlops/.
 
-Keep this virtual environment active in all three terminal windows.
 
 --------------------------------------------------------------------------------
-4.2  INSTALL PYTORCH (CPU BUILD)
+STEP 3 — Attach to the running tmux session
 --------------------------------------------------------------------------------
 
-PyTorch must be installed FIRST from its own package index, separate from
-the regular requirements.txt, because the CPU and CUDA builds have different
-package names in different registries.
+tmux keeps everything running after you disconnect.
 
-  Windows (PowerShell) and Linux / macOS:
-    pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu
+    tmux ls                  # list existing sessions
+    tmux attach -t 0         # attach to session 0 (or whatever name is listed)
 
-This downloads approximately 190 MB (CPU-only build, much smaller than the
-default CUDA build which is 2+ GB from PyPI).
+If no session exists, create one:
 
-Verify:
-    python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-    # Expected output: 2.3.0+cpu  False
+    tmux new -s app
 
---------------------------------------------------------------------------------
-4.3  INSTALL ALL OTHER BACKEND DEPENDENCIES
---------------------------------------------------------------------------------
+Inside tmux, open a new window with:   Ctrl+B  then  C
+Switch between windows with:           Ctrl+B  then  0 / 1 / 2 ...
+Detach (leave everything running):     Ctrl+B  then  D
 
-  pip install -r backend/requirements.txt
-
-This installs FastAPI, Uvicorn, HuggingFace Transformers, PyPDF2, python-docx,
-python-pptx, textstat, MLflow, and all other backend dependencies.
 
 --------------------------------------------------------------------------------
-4.4  START THE MLFLOW SERVER  (TERMINAL 1)
+STEP 4 — Check that containers are running
 --------------------------------------------------------------------------------
 
-Open a NEW terminal, activate the virtual environment, then run:
-
-  Windows (PowerShell):
-    .venv\Scripts\Activate.ps1
-    mlflow server `
-      --backend-store-uri sqlite:///mlflow.db `
-      --default-artifact-root ./mlruns `
-      --host 0.0.0.0 `
-      --port 5000
-
-  Linux / macOS:
-    source .venv/bin/activate
-    mlflow server \
-      --backend-store-uri sqlite:///mlflow.db \
-      --default-artifact-root ./mlruns \
-      --host 0.0.0.0 \
-      --port 5000
-
-Expected output:
-  [INFO] Starting gunicorn 22.0.0
-  [INFO] Listening at: http://0.0.0.0:5000
-
-Verify: open http://localhost:5000 in a browser.
-You should see the MLflow Tracking UI with an empty experiments list.
-
-Leave this terminal running.
-
---------------------------------------------------------------------------------
-4.5  START THE BACKEND API  (TERMINAL 2)
---------------------------------------------------------------------------------
-
-Open a NEW terminal, activate the virtual environment, then set the required
-environment variables and start the FastAPI server:
-
-  Windows (PowerShell):
-    .venv\Scripts\Activate.ps1
-
-    $env:MLFLOW_TRACKING_URI    = "http://localhost:5000"
-    $env:MLFLOW_EXPERIMENT_NAME = "ai_doc_interact"
-    $env:MODEL_BART             = "facebook/bart-large-cnn"
-    $env:MODEL_FLAN             = "google/flan-t5-base"
-    $env:MOCK_JWT_TOKEN         = "mock-jwt-token-for-academic-project"
-    $env:EPSILON                = "0.1"
-
-    uvicorn main:app --app-dir backend --host 0.0.0.0 --port 8000 --reload
-
-  Linux / macOS:
-    source .venv/bin/activate
-
-    export MLFLOW_TRACKING_URI="http://localhost:5000"
-    export MLFLOW_EXPERIMENT_NAME="ai_doc_interact"
-    export MODEL_BART="facebook/bart-large-cnn"
-    export MODEL_FLAN="google/flan-t5-base"
-    export MOCK_JWT_TOKEN="mock-jwt-token-for-academic-project"
-    export EPSILON="0.1"
-
-    uvicorn main:app --app-dir backend --host 0.0.0.0 --port 8000 --reload
-
-IMPORTANT — First startup will download model weights from Hugging Face:
-  facebook/bart-large-cnn : ~1.6 GB
-  google/flan-t5-base     : ~250 MB
-
-This download only happens once.  Subsequent startups load from the local
-Hugging Face cache (~/.cache/huggingface on Linux/macOS,
-%USERPROFILE%\.cache\huggingface on Windows).
-
-Expected final log line after models are loaded:
-  INFO  backend.main — Startup complete. Both models are loaded and ready.
-
-Verify:
-  Open a new PowerShell window and run:
-    Invoke-WebRequest -Uri http://localhost:8000/health -UseBasicParsing
-  Expected: {"status":"ok","device":"cpu"}
-
-Leave this terminal running.
-
---------------------------------------------------------------------------------
-4.6  START THE STREAMLIT FRONTEND  (TERMINAL 3)
---------------------------------------------------------------------------------
-
-Open a NEW terminal, activate the virtual environment, install the frontend
-dependencies, then start Streamlit:
-
-  Windows (PowerShell):
-    .venv\Scripts\Activate.ps1
-    pip install -r frontend/requirements.txt
-
-    $env:BACKEND_URL    = "http://localhost:8000"
-    $env:MOCK_JWT_TOKEN = "mock-jwt-token-for-academic-project"
-
-    streamlit run frontend/app.py --server.port 8501
-
-  Linux / macOS:
-    source .venv/bin/activate
-    pip install -r frontend/requirements.txt
-
-    export BACKEND_URL="http://localhost:8000"
-    export MOCK_JWT_TOKEN="mock-jwt-token-for-academic-project"
-
-    streamlit run frontend/app.py --server.port 8501
-
-Expected output:
-  You can now view your Streamlit app in your browser.
-  Local URL: http://localhost:8501
-
-Verify: open http://localhost:8501 in a browser.
-
-Leave this terminal running.
-
---------------------------------------------------------------------------------
-4.7  USE THE APPLICATION
---------------------------------------------------------------------------------
-
-  1. Open http://localhost:8501 — you see the Streamlit upload page.
-  2. Click "Choose a document to analyse" and pick a PDF, DOCX, or PPTX file.
-     A small document (1–5 pages) is recommended for the first test to keep
-     inference time short on CPU.
-  3. Click "Analyse Document".  A spinner appears — wait 30–120 seconds.
-  4. The summary, comprehension questions, and run metadata appear on screen.
-  5. Check the drift status (Normal or Drift Detected).
-  6. Click "Thumbs Up" or "Thumbs Down" to send feedback.
-  7. Open http://localhost:5000 and navigate to the "ai_doc_interact"
-     experiment to see the logged run with all metrics, parameters, tags,
-     and the generated text artifact.
-
-================================================================================
-5. RUNNING THE TEST SUITE LOCALLY
-================================================================================
-
-The tests mock torch, transformers, and MLflow so they run in seconds without
-any model downloads.
-
-  Windows (PowerShell):
-    .venv\Scripts\Activate.ps1
-    pip install pytest pytest-asyncio httpx
-    pytest backend/tests/ -v
-
-  Linux / macOS:
-    source .venv/bin/activate
-    pip install pytest pytest-asyncio httpx
-    pytest backend/tests/ -v
-
-Expected output (all tests should pass):
-  backend/tests/test_backend.py::TestAppStartup::test_both_model_slots_populated_after_startup   PASSED
-  backend/tests/test_backend.py::TestAppStartup::test_model_registry_values_are_callable          PASSED
-  backend/tests/test_backend.py::TestHealthEndpoint::test_health_returns_200                      PASSED
-  backend/tests/test_backend.py::TestHealthEndpoint::test_health_body_contains_status_ok          PASSED
-  backend/tests/test_backend.py::TestHealthEndpoint::test_health_body_contains_device_key         PASSED
-  backend/tests/test_backend.py::TestAuthentication::test_process_missing_auth_header_returns_401 PASSED
-  backend/tests/test_backend.py::TestAuthentication::test_process_wrong_token_returns_401         PASSED
-  backend/tests/test_backend.py::TestAuthentication::test_process_malformed_bearer_returns_401    PASSED
-  backend/tests/test_backend.py::TestAuthentication::test_feedback_missing_auth_header_returns_401 PASSED
-  backend/tests/test_backend.py::TestAuthentication::test_feedback_wrong_token_returns_401        PASSED
-  backend/tests/test_backend.py::TestFeedbackValidation::test_score_out_of_range_returns_422      PASSED
-  backend/tests/test_backend.py::TestFeedbackValidation::test_negative_score_returns_422          PASSED
-  backend/tests/test_backend.py::TestFeedbackValidation::test_missing_run_id_returns_422          PASSED
-  backend/tests/test_backend.py::TestFeedbackValidation::test_missing_score_returns_422           PASSED
-  backend/tests/test_backend.py::TestFeedbackValidation::test_empty_body_returns_422              PASSED
-  backend/tests/test_backend.py::TestDriftDetection::test_z_score_at_mean_is_zero                PASSED
-  backend/tests/test_backend.py::TestDriftDetection::test_z_score_one_sigma_above_mean            PASSED
-  backend/tests/test_backend.py::TestDriftDetection::test_z_score_zero_sigma_returns_zero         PASSED
-  backend/tests/test_backend.py::TestDriftDetection::test_normal_document_not_flagged             PASSED
-  backend/tests/test_backend.py::TestDriftDetection::test_extremely_short_document_flags_drift    PASSED
-
-================================================================================
-6. RUNNING THE FULL STACK WITH DOCKER COMPOSE
-================================================================================
-
-Only needed if you want to test the containerised deployment.
-Requires Docker Desktop to be running.
-
-  BUILD AND START ALL SERVICES:
-    docker compose up --build
-
-  To run in detached (background) mode:
-    docker compose up --build -d
-
-  CHECK STATUS:
+    cd ~
     docker compose ps
 
-  VIEW LOGS FOR A SPECIFIC SERVICE:
-    docker compose logs -f backend-api
-    docker compose logs -f mlflow-server
-    docker compose logs -f frontend-ui
+Expected output (all three services should show "running"):
 
-  STOP ALL SERVICES:
-    docker compose down
+    NAME              STATUS
+    ai_doc_mlflow     running (healthy)
+    ai_doc_backend    running
+    ai_doc_frontend   running
 
-  STOP AND DELETE ALL DATA (MLflow database, artifacts):
-    docker compose down -v
+If any container shows "exited" or "starting", see the troubleshooting section.
 
-First-run note: the backend-api image downloads model weights during startup
-(not during docker compose build).  The first `docker compose up` will take
-several minutes while the models download.  Watch progress with:
-    docker compose logs -f backend-api
 
-================================================================================
-7. SERVICE URLS REFERENCE
-================================================================================
+--------------------------------------------------------------------------------
+STEP 5 — Open the app in your browser
+--------------------------------------------------------------------------------
 
-  Service            Local (no Docker)          Docker Compose
-  -----------------  -------------------------  -------------------------
-  Streamlit UI       http://localhost:8501       http://localhost:8501
-  Backend API        http://localhost:8000       http://localhost:8000
-  Backend API docs   http://localhost:8000/docs  http://localhost:8000/docs
-  MLflow UI          http://localhost:5000       http://localhost:5000
+With the SSH tunnel from Step 1 still open, visit:
 
-The FastAPI automatic docs page (/docs) is useful for testing the API
-manually without Streamlit.
+    Streamlit UI   ->  http://localhost:9501
+    MLflow UI      ->  http://localhost:5000
+    API docs       ->  http://localhost:8000/docs
 
-================================================================================
-8. MODEL DOWNLOAD NOTE (FIRST RUN)
-================================================================================
+The backend takes about 2 minutes to load both AI models on first start.
+If the UI shows a connection error, wait and refresh.
 
-Both models are downloaded from https://huggingface.co on first startup:
 
-  Model                          Size       Cache location
-  ----------------------------   ---------  -------------------------------------------
-  facebook/bart-large-cnn        ~1.6 GB    Windows: %USERPROFILE%\.cache\huggingface\
-  google/flan-t5-base            ~250 MB    Linux:   ~/.cache/huggingface/
+--------------------------------------------------------------------------------
+PULLING NEW CODE AND REBUILDING
+--------------------------------------------------------------------------------
 
-Total first-run download: approximately 1.85 GB.
+When someone pushes a code update to GitHub, sync it to the server:
 
-After the first download, models are loaded from the local cache and startup
-takes only a few seconds (model loading into RAM, no download).
+    cd ~
+    git fetch origin && git reset --hard origin/newPlan
 
-To pre-download models manually before starting the server:
+Then rebuild only the service that changed.
 
-  python -c "from transformers import pipeline; pipeline('summarization', model='facebook/bart-large-cnn')"
-  python -c "from transformers import pipeline; pipeline('text2text-generation', model='google/flan-t5-base')"
+    # Frontend change (app.py)
+    docker compose build frontend-ui
+    docker compose up -d
 
-================================================================================
-9. TROUBLESHOOTING
-================================================================================
+    # Backend change (main.py, requirements.txt)
+    docker compose build backend-api
+    docker compose up -d
 
-PROBLEM: Backend startup fails with "Connection refused" to MLflow
------------------------------------------------------------------
-  The backend tries to connect to the MLflow server at startup.
-  Ensure the MLflow server (step 4.4) is running BEFORE starting the backend.
-  Check that the MLFLOW_TRACKING_URI environment variable is set correctly.
+    # Both changed
+    docker compose build
+    docker compose up -d
 
-PROBLEM: Models download slowly or fail
------------------------------------------------------------------
-  Ensure outbound HTTPS to huggingface.co is not blocked by a firewall.
-  On a corporate network, you may need to set the proxy:
-    Windows: $env:HTTPS_PROXY = "http://your-proxy:port"
-    Linux:   export HTTPS_PROXY="http://your-proxy:port"
+docker compose up -d restarts only containers whose image changed.
+It leaves everything else untouched.
 
-PROBLEM: Backend returns "No text could be extracted"
------------------------------------------------------------------
-  The uploaded PDF may be a scanned image (no text layer). Try a PDF that
-  was exported directly from a word processor rather than scanned.
 
-PROBLEM: Streamlit shows "Analysis failed: Connection refused"
------------------------------------------------------------------
-  The backend-api is not running or the BACKEND_URL env var is wrong.
-  Verify the backend is healthy: Invoke-WebRequest http://localhost:8000/health
+--------------------------------------------------------------------------------
+WATCHING LOGS
+--------------------------------------------------------------------------------
 
-PROBLEM: "torch not found" or import errors
------------------------------------------------------------------
-  Ensure PyTorch was installed BEFORE running pip install -r requirements.txt.
-  Run the PyTorch install command from step 4.2 again, then reinstall
-  requirements.txt.
+    docker logs -f ai_doc_backend    # backend — watch model loading and requests
+    docker logs -f ai_doc_frontend   # frontend
+    docker logs -f ai_doc_mlflow     # MLflow server
 
-PROBLEM: Inference is very slow
------------------------------------------------------------------
-  This is expected on CPU.  bart-large-cnn is a large model; inference on
-  a 3-page document can take 60–90 seconds on a mid-range laptop.
-  For faster results, try uploading a shorter document (1 page) first.
+Press Ctrl+C to stop following. The container keeps running.
 
-PROBLEM: pytest fails with "ModuleNotFoundError: No module named 'main'"
------------------------------------------------------------------
-  Run pytest from the repository ROOT directory, not from backend/:
-    cd F:\MDLOpsCourseProject\ai-doc-interact
-    pytest backend/tests/ -v
+The backend is ready when you see this line in its logs:
+    INFO  main — Startup complete. Both models are loaded and ready.
 
-================================================================================
-END OF DOCUMENT
+
+--------------------------------------------------------------------------------
+STOPPING AND STARTING
+--------------------------------------------------------------------------------
+
+    docker compose down        # stop and remove containers (data is preserved)
+    docker compose up -d       # start everything again
+
+    docker compose restart frontend-ui    # restart one service only
+
+
+--------------------------------------------------------------------------------
+TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+Container shows "exited":
+    docker logs ai_doc_backend     # read the error
+    docker compose up -d           # try restarting
+
+"Top-level object must be a mapping" error:
+    You are not in the project directory.
+    Run:  cd ~   and try again.
+
+"Connection refused" on localhost:9501:
+    Either the tunnel is not open (re-run Step 1) or the frontend container
+    has not started yet. Check:  docker compose ps
+
+Port already in use:
+    Another process on the server is using that port.
+    Check which host port is mapped in docker-compose.yml and adjust your
+    SSH tunnel accordingly.
+
+Git conflict on git pull:
+    cd ~
+    git fetch origin && git reset --hard origin/newPlan
+    This discards all local server changes and takes the remote version.
+
 ================================================================================
