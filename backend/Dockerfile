@@ -34,7 +34,12 @@ COPY requirements.txt .
 # index first, then install the remaining packages from PyPI.
 # If your server runs a different CUDA version, change cu121 to match:
 #   CUDA 11.8 -> cu118   |   CUDA 12.1 -> cu121   |   CUDA 12.4 -> cu124
-RUN pip install --no-cache-dir torch==2.3.0 \
+# The +cu121 build tag is required. Without it, pip resolves "torch==2.3.0"
+# to the PyPI meta-package which lists nvidia-cusparse-cu12 and similar CUDA
+# library packages as separate dependencies; those exact versions do not exist
+# on the PyTorch wheel index so the build fails. The +cu121 tag selects the
+# self-contained CUDA wheel directly and avoids that dependency chain entirely.
+RUN pip install --no-cache-dir "torch==2.3.0+cu121" \
         --index-url https://download.pytorch.org/whl/cu121 \
     && pip install --no-cache-dir -r requirements.txt
 
