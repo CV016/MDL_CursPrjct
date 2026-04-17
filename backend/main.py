@@ -56,7 +56,7 @@ import torch
 from docx import Document as DocxDocument
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile, status
 from pptx import Presentation
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from PyPDF2 import PdfReader
 from transformers import Pipeline, pipeline
 
@@ -193,6 +193,20 @@ async def on_startup() -> None:
     """
     logger.info("Configuring MLflow: tracking_uri=%s", MLFLOW_TRACKING_URI)
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+
+    # If the experiment was soft-deleted through the MLflow UI, restore it
+    # automatically so set_experiment never crashes on startup.  MLflow's
+    # soft-delete keeps the record in SQLite but marks it DELETED; calling
+    # set_experiment on a DELETED experiment raises MlflowException.
+    _client = mlflow.tracking.MlflowClient()
+    _existing = _client.get_experiment_by_name(MLFLOW_EXPERIMENT_NAME)
+    if _existing is not None and _existing.lifecycle_stage == "deleted":
+        _client.restore_experiment(_existing.experiment_id)
+        logger.warning(
+            "MLflow experiment '%s' was soft-deleted; restored automatically.",
+            MLFLOW_EXPERIMENT_NAME,
+        )
+
     mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
 
     logger.info("Loading summarisation model: %s (device=%s)", MODEL_BART, _device)
@@ -835,6 +849,8 @@ def _generate_questions(text: str) -> list[str]:
 class ProcessResponse(BaseModel):
     """Response body returned by POST /process."""
 
+    model_config = ConfigDict(protected_namespaces=())
+
     run_id: str
     model_name: str
     summary: str
@@ -874,8 +890,8 @@ async def process_document(
     Steps:
       1. Validate the Bearer token.
       2. Extract text from the uploaded file (PDF / DOCX / PPTX).
-      3. Run Z-score drift detection on word count and readability grade.
-      4. Select a model via the epsilon-greedy A/B router.
+      3. Run non-parametric drift detection on word count and readability grade.
+      4. Select a model via Thompson Sampling.
       5. Generate a summary (BART or FLAN-T5 depending on the selected model).
       6. Generate comprehension questions (always FLAN-T5).
       7. Open an MLflow run; log parameters, metrics, drift tag, and a text
