@@ -37,3 +37,6 @@ numpy==1.26.4
 
 # Statistical tests — KS test and Wasserstein distance for drift detection
 scipy==1.13.0
+
+# Prometheus metrics exposition — exposes /metrics for Prometheus scraping
+prometheus-client==0.20.0

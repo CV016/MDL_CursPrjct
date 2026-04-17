@@ -50,6 +50,7 @@ from typing import Any
 import mlflow
 import mlflow.tracking
 import numpy as np
+from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
 from scipy.stats import percentileofscore, wasserstein_distance
 import textstat
 import torch
@@ -153,6 +154,62 @@ _drift_windows: dict[str, deque[float]] = {
 _drift_window_lock: threading.Lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
+# Prometheus metrics definitions
+#
+# All metric names are prefixed with "ai_doc_" to avoid collision with
+# default process/platform metrics that prometheus-client registers.
+# Labels allow Prometheus and Grafana to slice data by model, file type, etc.
+# ---------------------------------------------------------------------------
+
+# Counts every completed /process request
+REQUEST_COUNT: Counter = Counter(
+    "ai_doc_requests_total",
+    "Total number of document analysis requests completed.",
+    ["model_name", "file_type", "drift_status"],
+)
+
+# Measures wall-clock inference time per request (in seconds)
+REQUEST_LATENCY: Histogram = Histogram(
+    "ai_doc_inference_latency_seconds",
+    "End-to-end inference latency in seconds.",
+    ["model_name"],
+    buckets=[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 60.0, 120.0],
+)
+
+# Counts drift events by type
+DRIFT_COUNTER: Counter = Counter(
+    "ai_doc_drift_total",
+    "Number of requests that triggered each drift status.",
+    ["drift_status"],
+)
+
+# Counts feedback submissions
+FEEDBACK_COUNTER: Counter = Counter(
+    "ai_doc_feedback_total",
+    "Number of feedback submissions by model and outcome.",
+    ["model_name", "outcome"],  # outcome: "thumbs_up" or "thumbs_down"
+)
+
+# Live Thompson Sampling posterior parameters — updated on every /feedback call
+THOMPSON_ALPHA: Gauge = Gauge(
+    "ai_doc_thompson_alpha",
+    "Current alpha (success count + prior) of each model's Beta posterior.",
+    ["model_name"],
+)
+
+THOMPSON_BETA: Gauge = Gauge(
+    "ai_doc_thompson_beta",
+    "Current beta (failure count + prior) of each model's Beta posterior.",
+    ["model_name"],
+)
+
+# Current size of the rolling window used for Wasserstein drift detection
+DRIFT_WINDOW_GAUGE: Gauge = Gauge(
+    "ai_doc_drift_window_size",
+    "Number of observations currently in the rolling drift window.",
+)
+
+# ---------------------------------------------------------------------------
 # FastAPI application instance
 # ---------------------------------------------------------------------------
 
@@ -165,6 +222,9 @@ app = FastAPI(
         "Sampling A/B model routing, MLflow experiment tracking, and feedback ingestion."
     ),
 )
+
+# Expose Prometheus metrics at GET /metrics (scraped by the Prometheus container)
+app.mount("/metrics", make_asgi_app())
 
 # ---------------------------------------------------------------------------
 # Model registry
@@ -222,6 +282,12 @@ async def on_startup() -> None:
         model=MODEL_FLAN,
         device=_device_idx,
     )
+
+    # Seed the Thompson Sampling gauges with the initial Beta(1,1) prior so
+    # Grafana has non-null values from the first Prometheus scrape.
+    for _m in ("bart", "flan"):
+        THOMPSON_ALPHA.labels(model_name=_m).set(1)
+        THOMPSON_BETA.labels(model_name=_m).set(1)
 
     logger.info("Startup complete. Both models are loaded and ready.")
 
@@ -559,13 +625,21 @@ def _update_thompson(model: str, thumbs_up: bool) -> None:
     key = "alpha" if thumbs_up else "beta"
     with _thompson_lock:
         _thompson_state[model][key] += 1
+        new_alpha = _thompson_state[model]["alpha"]
+        new_beta = _thompson_state[model]["beta"]
+
+    # Mirror the updated posterior into Prometheus gauges so Grafana always
+    # shows the current state of the A/B router.
+    THOMPSON_ALPHA.labels(model_name=model).set(new_alpha)
+    THOMPSON_BETA.labels(model_name=model).set(new_beta)
+
     logger.info(
         "Thompson posterior updated — model='%s' %s "
         "(α=%d β=%d)",
         model,
         "thumbs_up" if thumbs_up else "thumbs_down",
-        _thompson_state[model]["alpha"],
-        _thompson_state[model]["beta"],
+        new_alpha,
+        new_beta,
     )
 
 
@@ -1007,6 +1081,16 @@ async def process_document(
     # Thompson posterior without querying MLflow.
     _register_run(run_id, selected_model)
 
+    # Update Prometheus metrics
+    REQUEST_COUNT.labels(
+        model_name=selected_model,
+        file_type=file_extension,
+        drift_status=drift_info["drift_status"],
+    ).inc()
+    REQUEST_LATENCY.labels(model_name=selected_model).observe(inference_latency)
+    DRIFT_COUNTER.labels(drift_status=drift_info["drift_status"]).inc()
+    DRIFT_WINDOW_GAUGE.set(drift_info["window_size"])
+
     logger.info(
         "Inference complete — run_id=%s  model=%s  latency=%.3fs  drift=%s",
         run_id,
@@ -1070,6 +1154,10 @@ async def submit_feedback(
 
     if model and model in _thompson_state:
         _update_thompson(model, thumbs_up=body.score == 1)
+        FEEDBACK_COUNTER.labels(
+            model_name=model,
+            outcome="thumbs_up" if body.score == 1 else "thumbs_down",
+        ).inc()
     else:
         logger.warning(
             "Feedback for run_id=%s: model not found in run map "

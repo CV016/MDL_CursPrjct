@@ -1,0 +1,34 @@
+# =============================================================================
+# Prometheus scrape configuration
+#
+# Prometheus polls each target's /metrics endpoint on the interval defined
+# below and stores the results in its local time-series database.
+# Grafana then queries this database to draw live dashboards.
+#
+# Docker's internal DNS resolves service names (e.g. "backend-api") to the
+# correct container IP, so no hard-coded IP addresses are needed.
+# =============================================================================
+
+global:
+  scrape_interval: 15s       # How often Prometheus polls each target
+  evaluation_interval: 15s   # How often alerting rules are evaluated
+
+scrape_configs:
+
+  # --------------------------------------------------------------------------
+  # Backend API — FastAPI application metrics
+  # Exposes all ai_doc_* counters, histograms, and gauges defined in main.py
+  # plus default Python process metrics (CPU, memory, GC, open file handles).
+  # --------------------------------------------------------------------------
+  - job_name: "ai_doc_backend"
+    static_configs:
+      - targets: ["backend-api:8000"]
+    metrics_path: "/metrics"
+
+  # --------------------------------------------------------------------------
+  # Prometheus self-monitoring
+  # Allows Grafana to show Prometheus's own health (scrape durations, etc.).
+  # --------------------------------------------------------------------------
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

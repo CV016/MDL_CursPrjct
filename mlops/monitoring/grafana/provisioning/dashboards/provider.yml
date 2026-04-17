@@ -1,0 +1,18 @@
+# =============================================================================
+# Grafana dashboard provider provisioning
+#
+# Tells Grafana to scan the /var/lib/grafana/dashboards directory for JSON
+# dashboard files and load them automatically on startup.
+# =============================================================================
+
+apiVersion: 1
+
+providers:
+  - name: "AI-Doc Interact Dashboards"
+    orgId: 1
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

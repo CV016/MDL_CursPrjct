@@ -1,10 +1,12 @@
 # =============================================================================
 # AI-DOC INTERACT — Docker Compose Stack
 #
-# Three services on a shared bridge network:
+# Five services on a shared bridge network:
 #   mlflow-server  (port 5000) — self-hosted MLflow with SQLite backend
 #   backend-api    (port 8000) — FastAPI with both HuggingFace models + GPU
-#   frontend-ui    (port 8501) — Streamlit UI
+#   frontend-ui    (port 9501) — Streamlit UI
+#   prometheus     (port 9090) — time-series metrics collector
+#   grafana        (port 3000) — live operational dashboard
 #
 # GPU note:
 #   backend-api requests one NVIDIA GPU via the deploy.resources block.
@@ -25,6 +27,12 @@ version: "3.9"
 volumes:
   # Holds mlflow.db (SQLite experiment database) and the artifact directories
   mlflow_data:
+    driver: local
+  # Persists Prometheus time-series data across container restarts
+  prometheus_data:
+    driver: local
+  # Persists Grafana dashboards, users, and alert state
+  grafana_data:
     driver: local
 
 networks:
@@ -65,7 +73,7 @@ services:
       start_period: 45s
 
   # --------------------------------------------------------------------------
-  # Backend API — GPU-accelerated inference with epsilon-greedy A/B routing
+  # Backend API — GPU-accelerated inference with Thompson Sampling A/B routing
   # --------------------------------------------------------------------------
   backend-api:
     build:
@@ -124,5 +132,55 @@ services:
       # Host port 9501 matches the SSH tunnel (-L 9501:localhost:9501).
       # The container still runs Streamlit on its internal port 8501.
       - "9501:8501"
+    networks:
+      - ai_doc_net
+
+  # --------------------------------------------------------------------------
+  # Prometheus — scrapes /metrics from backend-api every 15 s and stores
+  # the results in a local time-series database.
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: ai_doc_prometheus
+    restart: unless-stopped
+    volumes:
+      # Scrape configuration — defines which services to monitor
+      - ./mlops/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Named volume so scraped data survives container restarts
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # Retain 30 days of metrics data
+      - "--storage.tsdb.retention.time=30d"
+    networks:
+      - ai_doc_net
+
+  # --------------------------------------------------------------------------
+  # Grafana — queries Prometheus and renders live operational dashboards.
+  # Default login: admin / admin  (change on first login).
+  # The datasource and dashboard are provisioned automatically from the
+  # files in mlops/monitoring/grafana/provisioning/.
+  # --------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.3
+    container_name: ai_doc_grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      # Auto-provision the Prometheus datasource and dashboard on startup
+      - ./mlops/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Dashboard JSON files loaded by the provider defined above
+      - ./mlops/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # Named volume for Grafana's internal state (users, alert history, etc.)
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
     networks:
       - ai_doc_net

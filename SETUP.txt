@@ -16,12 +16,14 @@ STEP 1 — Connect to the server with port forwarding
 Run this command in your local terminal (Windows PowerShell or Mac/Linux shell).
 Keep this terminal open the entire time you are using the app.
 
-    ssh -L 9501:localhost:9501 -L 8000:localhost:8000 -L 5000:localhost:5000 b22bb016@172.25.1.12
+    ssh -L 9501:localhost:9501 -L 8000:localhost:8000 -L 5000:localhost:5000 -L 9090:localhost:9090 -L 3000:localhost:3000 b22bb016@172.25.1.12
 
 What this does:
     localhost:9501  ->  Streamlit UI
     localhost:8000  ->  FastAPI backend  (Swagger docs at /docs)
     localhost:5000  ->  MLflow UI
+    localhost:9090  ->  Prometheus UI
+    localhost:3000  ->  Grafana dashboard  (login: admin / admin)
 
 Once connected you are inside the server. All commands below are run there.
 
@@ -65,10 +67,12 @@ STEP 4 — Check that containers are running
 
 Expected output (all three services should show "running"):
 
-    NAME              STATUS
-    ai_doc_mlflow     running (healthy)
-    ai_doc_backend    running
-    ai_doc_frontend   running
+    NAME                  STATUS
+    ai_doc_mlflow         running (healthy)
+    ai_doc_backend        running
+    ai_doc_frontend       running
+    ai_doc_prometheus     running
+    ai_doc_grafana        running
 
 If any container shows "exited" or "starting", see the troubleshooting section.
 
@@ -82,6 +86,8 @@ With the SSH tunnel from Step 1 still open, visit:
     Streamlit UI   ->  http://localhost:9501
     MLflow UI      ->  http://localhost:5000
     API docs       ->  http://localhost:8000/docs
+    Prometheus     ->  http://localhost:9090
+    Grafana        ->  http://localhost:3000  (login: admin / admin)
 
 The backend takes about 2 minutes to load both AI models on first start.
 If the UI shows a connection error, wait and refresh.
