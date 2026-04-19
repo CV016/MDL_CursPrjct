@@ -706,15 +706,30 @@ def _group_in_batches(items: list[str], batch_size: int) -> list[list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def _bart_single_pass(text: str, max_length: int = 220, min_length: int = 40) -> str:
+def _bart_single_pass(
+    text: str,
+    max_length: int = 220,
+    min_length: int = 40,
+    length_penalty: float = 1.0,
+    num_beams: int = 4,
+    early_stopping: bool = False,
+) -> str:
     """
     Run one BART summarisation pass.  The caller is responsible for ensuring
     `text` is within BART_CHUNK_TOKENS before calling this function.
+
+    length_penalty > 1.0 rewards the model during beam search for producing
+    longer, more detailed sequences.  It should only be applied on the final
+    summary pass; intermediate map-phase passes use the default (1.0) so their
+    outputs stay compact enough for the reduce step to process in one chunk.
     """
     output: list[dict[str, Any]] = _models["bart"](
         text,
         max_length=max_length,
         min_length=min_length,
+        length_penalty=length_penalty,
+        num_beams=num_beams,
+        early_stopping=early_stopping,
         do_sample=False,
     )
     return str(output[0]["summary_text"])
@@ -760,9 +775,18 @@ def _bart_map_reduce(
     bart_pipe = _models["bart"]
     token_ids = _encode(bart_pipe, text)
 
-    # Base case: document fits within one safe BART pass
+    # Base case: document fits within one safe BART pass.
+    # Use the full generation budget and length_penalty so the final output
+    # is detailed rather than truncated by BART's conservative defaults.
     if len(token_ids) <= BART_CHUNK_TOKENS:
-        return _bart_single_pass(text), []
+        return _bart_single_pass(
+            text,
+            max_length=600,
+            min_length=200,
+            length_penalty=2.0,
+            num_beams=4,
+            early_stopping=True,
+        ), []
 
     # Safety valve: at max recursion depth force a single truncated pass
     if depth >= 3:
@@ -773,7 +797,14 @@ def _bart_map_reduce(
             len(token_ids),
         )
         safe_text = _decode(bart_pipe, token_ids[:BART_CHUNK_TOKENS])
-        return _bart_single_pass(safe_text), []
+        return _bart_single_pass(
+            safe_text,
+            max_length=600,
+            min_length=200,
+            length_penalty=2.0,
+            num_beams=4,
+            early_stopping=True,
+        ), []
 
     chunks = _split_into_chunks(bart_pipe, text, BART_CHUNK_TOKENS)
     logger.info(
@@ -824,7 +855,10 @@ def _flan_map_reduce(text: str) -> str:
     flan_pipe = _models["flan"]
     token_ids = _encode(flan_pipe, text)
 
-    # Base case: fits in a single pass
+    # Base case: fits in a single pass.
+    # max_length=300 / min_length=60 give FLAN-T5 a larger budget so it
+    # produces a fully formed multi-sentence summary rather than a single
+    # short sentence (its default tendency on short token budgets).
     if len(token_ids) <= FLAN_CHUNK_TOKENS:
         prompt = (
             "Summarize the following article in a few paragraphs:"
@@ -832,8 +866,8 @@ def _flan_map_reduce(text: str) -> str:
         )
         output: list[dict[str, Any]] = flan_pipe(
             prompt,
-            max_length=220,
-            min_length=30,
+            max_length=300,
+            min_length=60,
             do_sample=False,
         )
         return str(output[0]["generated_text"])
@@ -874,37 +908,58 @@ def _flan_map_reduce(text: str) -> str:
         "Summarize the following article in a few paragraphs:"
         f"\n\n{combined}"
     )
+    # Use the same expanded budget as the base case so the final reduce
+    # pass produces a detailed summary rather than a truncated one.
     final_out: list[dict[str, Any]] = flan_pipe(
         final_prompt,
-        max_length=220,
-        min_length=30,
+        max_length=300,
+        min_length=60,
         do_sample=False,
     )
     return str(final_out[0]["generated_text"])
 
 
-def _summarise(text: str, model_name: str) -> tuple[str, list[list[str]] | None]:
+def _summarise(
+    text: str,
+    model_name: str,
+) -> tuple[str, list[list[str]] | None, int]:
     """
     Entry point for document summarisation.
 
     Routes to the correct Map-Reduce implementation based on the model
-    selected by the epsilon-greedy A/B router.  Both implementations handle
+    selected by the Thompson Sampling A/B router.  Both implementations handle
     documents of arbitrary length by chunking, summarising each chunk, and
     recursively (BART) or single-level (FLAN-T5) reducing the results.
 
+    The chunk count is computed by tokenising the document once before
+    inference so it can be surfaced in the API response and displayed on the
+    Streamlit UI without any additional inference overhead.
+
     Returns:
-      summary: final condensed text.
+      summary            : final condensed text.
       summary_point_groups: for BART only, top-level map mini-summaries grouped
-        in batches of 5 for UI display; None for FLAN.
+                            in batches of 5 for UI display; None for FLAN.
+      chunk_count        : number of token-accurate chunks the document was
+                           split into at depth-0 of the map phase.
     """
     if model_name == "bart":
+        bart_pipe = _models["bart"]
+        # Pre-compute the top-level chunk count using the same tokeniser and
+        # chunk size used inside _bart_map_reduce so the value is exact.
+        chunk_count: int = len(
+            _split_into_chunks(bart_pipe, text, BART_CHUNK_TOKENS)
+        )
         summary, mini_summaries = _bart_map_reduce(
             text,
             collect_top_level_points=True,
         )
         point_groups = _group_in_batches(mini_summaries, batch_size=5)
-        return summary, (point_groups or None)
-    return _flan_map_reduce(text), None
+        return summary, (point_groups or None), chunk_count
+
+    # FLAN path
+    flan_pipe = _models["flan"]
+    chunk_count = len(_split_into_chunks(flan_pipe, text, FLAN_CHUNK_TOKENS))
+    return _flan_map_reduce(text), None, chunk_count
 
 
 # ---------------------------------------------------------------------------
@@ -971,13 +1026,17 @@ def _generate_questions(text: str) -> list[str]:
     seen: set[str] = set()
 
     for chunk in chunks:
+        # Explicit instruction prefix asks FLAN to produce three numbered
+        # questions rather than a single question per call.  This is the
+        # second leg of the two-call sequential pipeline (summary + questions)
+        # that FLAN-T5 needs for reliable task separation.
         prompt = (
-            "Generate a comprehension question based on the following text:"
+            "Generate 3 reading comprehension questions based on this text:"
             f"\n\n{chunk}"
         )
         output: list[dict[str, Any]] = flan_pipe(
             prompt,
-            max_length=160,
+            max_length=150,
             min_length=24,
             do_sample=False,
         )
@@ -1010,6 +1069,10 @@ class ProcessResponse(BaseModel):
     questions: list[str]
     drift_status: str
     inference_latency: float
+    # Number of token-accurate chunks the document was split into at the
+    # top-level map phase.  A value of 1 means the whole document fitted
+    # within one model pass and no splitting was required.
+    chunk_count: int
 
 
 class FeedbackRequest(BaseModel):
@@ -1082,7 +1145,7 @@ async def process_document(
     start_ts: float = time.monotonic()
 
     try:
-        summary, summary_point_groups = _summarise(text, selected_model)
+        summary, summary_point_groups, chunk_count = _summarise(text, selected_model)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1126,6 +1189,9 @@ async def process_document(
             "wc_wasserstein": drift_info["wc_wasserstein"],
             "fk_wasserstein": drift_info["fk_wasserstein"],
             "drift_window_size": float(drift_info["window_size"]),
+            # Number of map-phase chunks; useful for understanding latency
+            # scaling and is surfaced on the Streamlit UI.
+            "chunk_count": float(chunk_count),
         })
 
         # Tags: categorical metadata for filtering in the MLflow UI
@@ -1200,6 +1266,7 @@ async def process_document(
         questions=questions,
         drift_status=drift_info["drift_status"],
         inference_latency=round(inference_latency, 4),
+        chunk_count=chunk_count,
     )
 
 

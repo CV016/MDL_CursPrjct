@@ -17,6 +17,7 @@ User workflow:
 
 Session state keys:
   result             — dict returned by POST /process; persists across reruns.
+                       Includes chunk_count (int) from the updated API response.
   feedback_submitted — bool; prevents duplicate feedback submissions.
 """
 
@@ -165,8 +166,8 @@ if "result" in st.session_state:
 
     st.divider()
 
-    # Metadata row — three equal columns for the key run metadata
-    col_model, col_latency, col_drift = st.columns(3)
+    # Metadata row — four equal columns for the key run metadata
+    col_model, col_latency, col_drift, col_chunks = st.columns(4)
 
     with col_model:
         st.metric(
@@ -175,7 +176,7 @@ if "result" in st.session_state:
             help=(
                 "bart = facebook/bart-large-cnn (summarisation-tuned). "
                 "flan = google/flan-t5-base (instruction-tuned). "
-                "Selected by the epsilon-greedy A/B router."
+                "Selected by the Thompson Sampling A/B router."
             ),
         )
 
@@ -185,6 +186,21 @@ if "result" in st.session_state:
             label="Inference Time",
             value=f"{latency_val:.2f} s",
             help="Wall-clock time measured inside the backend for this inference run.",
+        )
+
+    with col_chunks:
+        chunk_count_val: int = result.get("chunk_count", 1)
+        st.metric(
+            label="Chunks Processed",
+            value=str(chunk_count_val),
+            help=(
+                "Number of token-accurate chunks the document was split into "
+                "during the map phase of inference. "
+                "A value of 1 means the entire document fitted within a single "
+                "model pass and no splitting was required. "
+                "Higher values indicate a longer document that required "
+                "Map-Reduce processing."
+            ),
         )
 
     with col_drift:
