@@ -235,6 +235,24 @@ if "result" in st.session_state:
     else:
         st.write("No summary was generated.")
 
+    # Optional BART map-phase points grouped in batches of 5.
+    point_groups_raw = result.get("summary_point_groups")
+    if (
+        result.get("model_name") == "bart"
+        and isinstance(point_groups_raw, list)
+        and point_groups_raw
+    ):
+        st.subheader("BART Chunk Points")
+        st.caption("Top-level BART mini-summaries grouped in batches of 5 chunks.")
+        for group_idx, group in enumerate(point_groups_raw, start=1):
+            if not isinstance(group, list):
+                continue
+            st.markdown(f"**Group {group_idx}**")
+            for point in group:
+                point_text = str(point).strip()
+                if point_text:
+                    st.write(f"- {point_text}")
+
     # Questions section
     st.subheader("Comprehension Questions")
     questions: list[str] = result.get("questions", [])

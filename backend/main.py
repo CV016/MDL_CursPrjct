@@ -41,6 +41,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -690,12 +691,22 @@ def _split_into_chunks(pipe: Pipeline, text: str, chunk_size: int) -> list[str]:
     return chunks
 
 
+def _group_in_batches(items: list[str], batch_size: int) -> list[list[str]]:
+    """Group a flat list into fixed-size batches for UI presentation."""
+    if batch_size <= 0:
+        return [items] if items else []
+    return [
+        items[start: start + batch_size]
+        for start in range(0, len(items), batch_size)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Inference helpers — Map-Reduce summarisation
 # ---------------------------------------------------------------------------
 
 
-def _bart_single_pass(text: str, max_length: int = 200, min_length: int = 30) -> str:
+def _bart_single_pass(text: str, max_length: int = 220, min_length: int = 40) -> str:
     """
     Run one BART summarisation pass.  The caller is responsible for ensuring
     `text` is within BART_CHUNK_TOKENS before calling this function.
@@ -709,7 +720,11 @@ def _bart_single_pass(text: str, max_length: int = 200, min_length: int = 30) ->
     return str(output[0]["summary_text"])
 
 
-def _bart_map_reduce(text: str, depth: int = 0) -> str:
+def _bart_map_reduce(
+    text: str,
+    depth: int = 0,
+    collect_top_level_points: bool = False,
+) -> tuple[str, list[str]]:
     """
     Summarise `text` using the Map-Reduce strategy to handle documents longer
     than BART's 1024-token position-embedding limit.
@@ -737,13 +752,17 @@ def _bart_map_reduce(text: str, depth: int = 0) -> str:
         Chunk 4 (tokens 2701 3000)→ BART → Mini-summary 4 (~100 tokens)
       Reduce:
         Combined mini-summaries (~550 tokens) → BART → Final summary
+
+        collect_top_level_points is used by /process to expose the first map pass
+        mini-summaries in the UI (grouped in sets of 5). Recursive calls always
+        return only the reduced summary.
     """
     bart_pipe = _models["bart"]
     token_ids = _encode(bart_pipe, text)
 
     # Base case: document fits within one safe BART pass
     if len(token_ids) <= BART_CHUNK_TOKENS:
-        return _bart_single_pass(text)
+        return _bart_single_pass(text), []
 
     # Safety valve: at max recursion depth force a single truncated pass
     if depth >= 3:
@@ -754,7 +773,7 @@ def _bart_map_reduce(text: str, depth: int = 0) -> str:
             len(token_ids),
         )
         safe_text = _decode(bart_pipe, token_ids[:BART_CHUNK_TOKENS])
-        return _bart_single_pass(safe_text)
+        return _bart_single_pass(safe_text), []
 
     chunks = _split_into_chunks(bart_pipe, text, BART_CHUNK_TOKENS)
     logger.info(
@@ -770,7 +789,7 @@ def _bart_map_reduce(text: str, depth: int = 0) -> str:
     mini_summaries: list[str] = []
     for idx, chunk in enumerate(chunks):
         logger.info("Map-Reduce BART: chunk %d/%d", idx + 1, len(chunks))
-        mini = _bart_single_pass(chunk, max_length=150, min_length=20)
+        mini = _bart_single_pass(chunk, max_length=170, min_length=28)
         mini_summaries.append(mini)
 
     # REDUCE: join mini-summaries and recurse; the combined text is much
@@ -784,7 +803,10 @@ def _bart_map_reduce(text: str, depth: int = 0) -> str:
         len(mini_summaries),
         len(_encode(bart_pipe, combined)),
     )
-    return _bart_map_reduce(combined, depth=depth + 1)
+    reduced_summary, _ = _bart_map_reduce(combined, depth=depth + 1)
+    if collect_top_level_points:
+        return reduced_summary, mini_summaries
+    return reduced_summary, []
 
 
 def _flan_map_reduce(text: str) -> str:
@@ -792,8 +814,8 @@ def _flan_map_reduce(text: str) -> str:
     Summarise `text` using FLAN-T5 with a Map-Reduce strategy to handle
     documents longer than FLAN-T5-base's 512-token limit.
 
-    Map  : split into FLAN_CHUNK_TOKENS-sized chunks; summarise each with a
-           short instruction prompt ("Summarize in 1-2 sentences: …").
+        Map  : split into FLAN_CHUNK_TOKENS-sized chunks; summarise each with an
+            explicit instruction prefix.
     Reduce: concatenate mini-summaries; if the combined text still exceeds
            FLAN_CHUNK_TOKENS, truncate it before the final pass (FLAN-T5 is
            less suited to deep recursion than BART because its outputs can be
@@ -805,13 +827,13 @@ def _flan_map_reduce(text: str) -> str:
     # Base case: fits in a single pass
     if len(token_ids) <= FLAN_CHUNK_TOKENS:
         prompt = (
-            "Summarize the following document in a few clear sentences:"
+            "Summarize the following article in a few paragraphs:"
             f"\n\n{text}"
         )
         output: list[dict[str, Any]] = flan_pipe(
             prompt,
-            max_length=200,
-            min_length=20,
+            max_length=220,
+            min_length=30,
             do_sample=False,
         )
         return str(output[0]["generated_text"])
@@ -828,11 +850,14 @@ def _flan_map_reduce(text: str) -> str:
     mini_summaries: list[str] = []
     for idx, chunk in enumerate(chunks):
         logger.info("Map-Reduce FLAN: chunk %d/%d", idx + 1, len(chunks))
-        prompt = f"Summarize the following text in 1-2 sentences:\n\n{chunk}"
+        prompt = (
+            "Summarize the following article chunk in 2-3 clear sentences:"
+            f"\n\n{chunk}"
+        )
         out: list[dict[str, Any]] = flan_pipe(
             prompt,
-            max_length=100,
-            min_length=15,
+            max_length=120,
+            min_length=20,
             do_sample=False,
         )
         mini_summaries.append(str(out[0]["generated_text"]))
@@ -846,19 +871,19 @@ def _flan_map_reduce(text: str) -> str:
         combined = _decode(flan_pipe, combined_ids[:FLAN_CHUNK_TOKENS])
 
     final_prompt = (
-        "Summarize the following document in a few clear sentences:"
+        "Summarize the following article in a few paragraphs:"
         f"\n\n{combined}"
     )
     final_out: list[dict[str, Any]] = flan_pipe(
         final_prompt,
-        max_length=200,
-        min_length=20,
+        max_length=220,
+        min_length=30,
         do_sample=False,
     )
     return str(final_out[0]["generated_text"])
 
 
-def _summarise(text: str, model_name: str) -> str:
+def _summarise(text: str, model_name: str) -> tuple[str, list[list[str]] | None]:
     """
     Entry point for document summarisation.
 
@@ -866,15 +891,62 @@ def _summarise(text: str, model_name: str) -> str:
     selected by the epsilon-greedy A/B router.  Both implementations handle
     documents of arbitrary length by chunking, summarising each chunk, and
     recursively (BART) or single-level (FLAN-T5) reducing the results.
+
+    Returns:
+      summary: final condensed text.
+      summary_point_groups: for BART only, top-level map mini-summaries grouped
+        in batches of 5 for UI display; None for FLAN.
     """
     if model_name == "bart":
-        return _bart_map_reduce(text)
-    return _flan_map_reduce(text)
+        summary, mini_summaries = _bart_map_reduce(
+            text,
+            collect_top_level_points=True,
+        )
+        point_groups = _group_in_batches(mini_summaries, batch_size=5)
+        return summary, (point_groups or None)
+    return _flan_map_reduce(text), None
 
 
 # ---------------------------------------------------------------------------
 # Inference helpers — question generation
 # ---------------------------------------------------------------------------
+
+
+def _extract_questions(generated_text: str) -> list[str]:
+    """
+    Parse one or more questions from a FLAN generation.
+
+    FLAN may return numbered lists, bullet lists, or a single line with
+    multiple question marks. This helper normalises those variants.
+    """
+    raw = generated_text.strip()
+    if not raw:
+        return []
+
+    candidates: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        cleaned = re.sub(r"^(?:\d+[\).:-]\s*|[-*]\s*)", "", stripped).strip()
+        if cleaned:
+            candidates.append(cleaned)
+
+    parsed: list[str] = []
+    for candidate in candidates:
+        parts = [part.strip() for part in candidate.split("?") if part.strip()]
+        if len(parts) > 1 or candidate.endswith("?"):
+            parsed.extend(f"{part}?" for part in parts)
+        else:
+            parsed.append(candidate)
+
+    if parsed:
+        return parsed
+
+    fallback_parts = [part.strip() for part in raw.split("?") if part.strip()]
+    if fallback_parts:
+        return [f"{part}?" for part in fallback_parts]
+    return [raw]
 
 
 def _generate_questions(text: str) -> list[str]:
@@ -891,6 +963,7 @@ def _generate_questions(text: str) -> list[str]:
     # Split using the same token-accurate chunking used by _flan_map_reduce
     # so question coverage matches the summarisation coverage.
     max_chunks = 5
+    max_questions = 9
     all_chunks = _split_into_chunks(flan_pipe, text, FLAN_CHUNK_TOKENS)
     chunks = all_chunks[:max_chunks]
 
@@ -904,13 +977,18 @@ def _generate_questions(text: str) -> list[str]:
         )
         output: list[dict[str, Any]] = flan_pipe(
             prompt,
-            max_length=128,
+            max_length=160,
+            min_length=24,
             do_sample=False,
         )
-        question = str(output[0]["generated_text"]).strip()
-        if question and question not in seen:
-            seen.add(question)
-            questions.append(question)
+        generated_text = str(output[0]["generated_text"]).strip()
+        for question in _extract_questions(generated_text):
+            question = question.strip()
+            if question and question not in seen:
+                seen.add(question)
+                questions.append(question)
+            if len(questions) >= max_questions:
+                return questions
 
     return questions
 
@@ -928,6 +1006,7 @@ class ProcessResponse(BaseModel):
     run_id: str
     model_name: str
     summary: str
+    summary_point_groups: list[list[str]] | None = None
     questions: list[str]
     drift_status: str
     inference_latency: float
@@ -1003,7 +1082,7 @@ async def process_document(
     start_ts: float = time.monotonic()
 
     try:
-        summary: str = _summarise(text, selected_model)
+        summary, summary_point_groups = _summarise(text, selected_model)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1056,10 +1135,24 @@ async def process_document(
         })
 
         # Artifact: persist the generated text so results are reproducible
+        bart_points_block = ""
+        if summary_point_groups:
+            grouped_lines: list[str] = []
+            for group_idx, group in enumerate(summary_point_groups, start=1):
+                grouped_lines.append(f"Group {group_idx}")
+                grouped_lines.extend(f"- {point}" for point in group)
+                grouped_lines.append("")
+            bart_points_block = (
+                "=== BART CHUNK POINTS (GROUPED BY 5) ===\n"
+                + "\n".join(grouped_lines).rstrip()
+                + "\n\n"
+            )
+
         artifact_text: str = (
             "=== SUMMARY ===\n"
             f"{summary}\n\n"
-            "=== COMPREHENSION QUESTIONS ===\n"
+            + bart_points_block
+            + "=== COMPREHENSION QUESTIONS ===\n"
             + "\n".join(
                 f"{idx + 1}. {q}" for idx, q in enumerate(questions)
             )
@@ -1103,6 +1196,7 @@ async def process_document(
         run_id=run_id,
         model_name=selected_model,
         summary=summary,
+        summary_point_groups=summary_point_groups,
         questions=questions,
         drift_status=drift_info["drift_status"],
         inference_latency=round(inference_latency, 4),
