@@ -51,12 +51,13 @@ from typing import Any
 import mlflow
 import mlflow.tracking
 import numpy as np
-from prometheus_client import Counter, Gauge, Histogram, make_asgi_app
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from scipy.stats import percentileofscore, wasserstein_distance
 import textstat
 import torch
 from docx import Document as DocxDocument
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile, status
+from fastapi.responses import Response
 from pptx import Presentation
 from pydantic import BaseModel, ConfigDict
 from PyPDF2 import PdfReader
@@ -223,9 +224,6 @@ app = FastAPI(
         "Sampling A/B model routing, MLflow experiment tracking, and feedback ingestion."
     ),
 )
-
-# Expose Prometheus metrics at GET /metrics (scraped by the Prometheus container)
-app.mount("/metrics", make_asgi_app())
 
 # ---------------------------------------------------------------------------
 # Model registry
@@ -1095,6 +1093,16 @@ class FeedbackResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+@app.get("/metrics")
+async def prometheus_metrics() -> Response:
+    """
+    Prometheus scrape endpoint. Uses generate_latest() on the default registry
+    so all ai_doc_* metrics are exposed. A plain route is used instead of
+    app.mount() so Starlette never mis-routes scrapes from the Prometheus container.
+    """
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/process", response_model=ProcessResponse)
 async def process_document(
     file: UploadFile = File(description="PDF, DOCX, or PPTX document to analyse."),
@@ -1257,6 +1265,9 @@ async def process_document(
         inference_latency,
         drift_info["drift_status"],
     )
+    # Full summary text is written here so operators can inspect results in
+    # container logs (docker logs ai_doc_backend) without opening MLflow or the UI.
+    logger.info("Generated summary (run_id=%s):\n%s", run_id, summary)
 
     return ProcessResponse(
         run_id=run_id,

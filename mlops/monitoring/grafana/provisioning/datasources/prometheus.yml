@@ -10,6 +10,10 @@ apiVersion: 1
 
 datasources:
   - name: Prometheus
+    # Must match the "uid" field in ai_doc_overview.json panel datasources.
+    # Without this, Grafana auto-generates a random UID and every panel shows
+    # "No data" because the queries cannot resolve the datasource.
+    uid: prometheus
     type: prometheus
     access: proxy
     # "prometheus" resolves to the Prometheus container via Docker's DNS

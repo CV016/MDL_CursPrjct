@@ -170,4 +170,14 @@ Git conflict on git pull:
     git fetch origin && git reset --hard origin/newPlan
     This discards all local server changes and takes the remote version.
 
+Grafana shows "No data" but Prometheus works:
+    The Grafana datasource must use uid=prometheus to match the dashboard.
+    If you upgraded from an older compose file, remove Grafana's volume so
+    provisioning re-runs:  docker compose down && docker volume rm <project>_grafana_data
+    (use  docker volume ls  to find the exact name), then  docker compose up -d
+
+Verify the monitoring chain on the server:
+    curl -s http://localhost:8000/metrics | head     # must show ai_doc_* lines
+    Open Prometheus UI -> Status -> Targets -> ai_doc_backend should be STATE=UP
+
 ================================================================================

@@ -143,6 +143,8 @@ services:
     image: prom/prometheus:v2.52.0
     container_name: ai_doc_prometheus
     restart: unless-stopped
+    depends_on:
+      - backend-api
     volumes:
       # Scrape configuration — defines which services to monitor
       - ./mlops/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -181,6 +183,7 @@ services:
       # Named volume for Grafana's internal state (users, alert history, etc.)
       - grafana_data:/var/lib/grafana
     ports:
-      - "3000:3000"
+      # Host port 3001 -> container port 3000 (Grafana always listens on 3000 internally)
+      - "3001:3000"
     networks:
       - ai_doc_net
