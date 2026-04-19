@@ -40,3 +40,9 @@ scipy==1.13.0
 
 # Prometheus metrics exposition — exposes /metrics for Prometheus scraping
 prometheus-client==0.20.0
+
+# Automatic HTTP request/latency metrics on /metrics (works alongside custom ai_doc_* metrics)
+prometheus-fastapi-instrumentator==7.0.0
+
+# NLI cross-encoder for automated summary quality judging (CPU to avoid GPU RAM contention)
+sentence-transformers==3.0.1

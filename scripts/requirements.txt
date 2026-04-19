@@ -1,0 +1,7 @@
+# Traffic simulator and drift dataset builder (run on your laptop or the server;
+# not part of the Docker backend image).
+
+pandas>=2.0.0,<3.0.0
+datasets>=2.18.0,<3.0.0
+requests>=2.31.0
+tqdm>=4.66.0

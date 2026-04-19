@@ -19,6 +19,8 @@ import os
 import sys
 from unittest.mock import MagicMock
 
+import numpy as np
+
 # ---------------------------------------------------------------------------
 # Mock heavy ML dependencies BEFORE any test module imports main.py.
 # Setting entries in sys.modules intercepts the import machinery so that
@@ -38,6 +40,26 @@ sys.modules["transformers"] = transformers_mock
 # mlflow mock — prevent any real HTTP connections to a tracking server
 sys.modules["mlflow"] = MagicMock()
 sys.modules["mlflow.tracking"] = MagicMock()
+
+# sentence_transformers — CrossEncoder judge (startup loads a tiny mock)
+_judge_instance = MagicMock()
+_judge_instance.predict.return_value = np.array([[0.1, 0.8, 0.1]])
+_judge_instance.model.config.id2label = {
+    0: "contradiction",
+    1: "entailment",
+    2: "neutral",
+}
+_st = MagicMock()
+_st.CrossEncoder = MagicMock(return_value=_judge_instance)
+sys.modules["sentence_transformers"] = _st
+
+# prometheus_fastapi_instrumentator — chained .instrument().expose() at import time
+_inst_chain = MagicMock()
+_inst_chain.instrument.return_value = _inst_chain
+_inst_chain.expose.return_value = None
+_pinstrument = MagicMock()
+_pinstrument.Instrumentator.return_value = _inst_chain
+sys.modules["prometheus_fastapi_instrumentator"] = _pinstrument
 
 # ---------------------------------------------------------------------------
 # Add the backend/ directory to sys.path so `import main` works when pytest

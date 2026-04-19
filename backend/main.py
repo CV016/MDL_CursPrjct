@@ -22,6 +22,11 @@ the academic MLOps pipeline:
     is returned to the frontend so the user's feedback can be appended.
   - Feedback ingestion: /feedback resumes the MLflow run by run_id and logs
     the user_satisfaction_score metric (1 = thumbs-up, 0 = thumbs-down).
+  - Automated judge (optional): after each /process, a background task scores
+    source vs summary with an NLI cross-encoder; logs to MLflow and binarizes
+    the entailment probability to update Thompson Sampling (same path as 👍/👎).
+  - Prometheus: prometheus-fastapi-instrumentator exposes HTTP traffic metrics on
+    /metrics together with custom ai_doc_* counters (single registry).
 
 Endpoints:
   POST /process  — accepts a multipart file upload; returns summary, questions,
@@ -51,16 +56,17 @@ from typing import Any
 import mlflow
 import mlflow.tracking
 import numpy as np
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from prometheus_client import Counter, Gauge, Histogram
 from scipy.stats import percentileofscore, wasserstein_distance
 import textstat
 import torch
 from docx import Document as DocxDocument
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile, status
-from fastapi.responses import Response
+from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, UploadFile, status
 from pptx import Presentation
 from pydantic import BaseModel, ConfigDict
 from PyPDF2 import PdfReader
+from prometheus_fastapi_instrumentator import Instrumentator
+from sentence_transformers import CrossEncoder
 from transformers import Pipeline, pipeline
 
 # ---------------------------------------------------------------------------
@@ -96,6 +102,17 @@ MODEL_FLAN: str = os.environ.get("MODEL_FLAN", "google/flan-t5-base")
 MOCK_JWT_TOKEN: str = os.environ.get(
     "MOCK_JWT_TOKEN", "mock-jwt-token-for-academic-project"
 )
+
+# LLM-as-a-judge: NLI cross-encoder scores premise/hypothesis entailment; runs in BackgroundTasks
+MODEL_JUDGE: str = os.environ.get(
+    "MODEL_JUDGE", "cross-encoder/nli-deberta-base"
+)
+JUDGE_ENABLED: bool = os.environ.get("JUDGE_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+JUDGE_THRESHOLD: float = float(os.environ.get("JUDGE_THRESHOLD", "0.65"))
 
 # ---------------------------------------------------------------------------
 # Drift detection — non-parametric reference population
@@ -192,6 +209,12 @@ FEEDBACK_COUNTER: Counter = Counter(
     ["model_name", "outcome"],  # outcome: "thumbs_up" or "thumbs_down"
 )
 
+AUTOMATED_JUDGE_COUNTER: Counter = Counter(
+    "ai_doc_automated_judge_total",
+    "NLI automated judge verdicts after binarization.",
+    ["model_name", "verdict"],  # verdict: thumbs_up or thumbs_down
+)
+
 # Live Thompson Sampling posterior parameters — updated on every /feedback call
 THOMPSON_ALPHA: Gauge = Gauge(
     "ai_doc_thompson_alpha",
@@ -240,6 +263,9 @@ _device_idx: int = 0 if _device == "cuda" else -1
 # Keyed by model short-name ("bart" or "flan") for clear lookup
 _models: dict[str, Pipeline] = {}
 
+# NLI cross-encoder for automated grading — kept on CPU so BART/FLAN keep the GPU
+_judge_ce: CrossEncoder | None = None
+
 
 @app.on_event("startup")
 async def on_startup() -> None:
@@ -281,6 +307,17 @@ async def on_startup() -> None:
         model=MODEL_FLAN,
         device=_device_idx,
     )
+
+    global _judge_ce
+    if JUDGE_ENABLED:
+        logger.info(
+            "Loading NLI judge model: %s (device=cpu; avoids competing with summarisers)",
+            MODEL_JUDGE,
+        )
+        _judge_ce = CrossEncoder(MODEL_JUDGE, device="cpu")
+    else:
+        logger.info("Automated judge disabled (JUDGE_ENABLED=false).")
+        _judge_ce = None
 
     # Seed the Thompson Sampling gauges with the initial Beta(1,1) prior so
     # Grafana has non-null values from the first Prometheus scrape.
@@ -547,7 +584,8 @@ def _detect_drift(text: str) -> dict[str, Any]:
 # Thompson Sampling A/B model router — in-memory state
 # ---------------------------------------------------------------------------
 #
-# State is kept entirely in memory and updated only when /feedback is called.
+# State is kept entirely in memory and updated when /feedback is called or when
+# the automated NLI judge finishes (BackgroundTasks).
 # This eliminates an MLflow database read on every /process request, which
 # would otherwise become the dominant source of inference latency.
 #
@@ -589,7 +627,7 @@ def _select_model() -> str:
 
     One value is sampled from Beta(alpha, beta) for each model.  The model
     with the higher draw wins the request.  No database query is made here —
-    the posteriors are updated lazily only when feedback arrives.
+    the posteriors are updated when /feedback runs or the automated judge finishes.
     """
     with _thompson_lock:
         samples: dict[str, float] = {
@@ -640,6 +678,64 @@ def _update_thompson(model: str, thumbs_up: bool) -> None:
         new_alpha,
         new_beta,
     )
+
+
+def _entailment_score(premise: str, hypothesis: str) -> float:
+    """
+    Return softmax probability of the **entailment** class for an NLI pair.
+
+    The cross-encoder was trained on (premise, hypothesis) pairs; here the
+    source document is the premise and the generated summary is the hypothesis.
+    """
+    if _judge_ce is None:
+        return 0.0
+    p_trunc = premise[:12000]
+    h_trunc = hypothesis[:2000]
+    probs = _judge_ce.predict([[p_trunc, h_trunc]], apply_softmax=True)
+    row = np.asarray(probs[0]).flatten()
+    id2label = getattr(_judge_ce.model.config, "id2label", None) or {}
+    for idx_key, lab in id2label.items():
+        if str(lab).lower() == "entailment":
+            return float(row[int(idx_key)])
+    return float(np.max(row))
+
+
+def automated_judge_worker(
+    source_text: str,
+    generated_summary: str,
+    model_used: str,
+    run_id: str,
+) -> None:
+    """
+    Runs after the HTTP response is returned. Logs NLI scores to MLflow and
+    applies the binarized reward to the Thompson router (same update path as 👍/👎).
+    """
+    if _judge_ce is None or not source_text.strip() or not generated_summary.strip():
+        return
+    try:
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        score = _entailment_score(source_text, generated_summary)
+        is_thumbs_up = score > JUDGE_THRESHOLD
+        with mlflow.start_run(run_id=run_id):
+            mlflow.log_metric("automated_reward_score", float(score))
+            mlflow.log_metric("automated_is_thumbs_up", float(int(is_thumbs_up)))
+
+        if model_used in _thompson_state:
+            _update_thompson(model_used, thumbs_up=is_thumbs_up)
+            AUTOMATED_JUDGE_COUNTER.labels(
+                model_name=model_used,
+                verdict="thumbs_up" if is_thumbs_up else "thumbs_down",
+            ).inc()
+
+        logger.info(
+            "Automated judge — run_id=%s  model=%s  score=%.4f  thumbs_up=%s",
+            run_id,
+            model_used,
+            score,
+            is_thumbs_up,
+        )
+    except Exception as exc:
+        logger.exception("Automated judge failed for run_id=%s: %s", run_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1093,18 +1189,9 @@ class FeedbackResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-@app.get("/metrics")
-async def prometheus_metrics() -> Response:
-    """
-    Prometheus scrape endpoint. Uses generate_latest() on the default registry
-    so all ai_doc_* metrics are exposed. A plain route is used instead of
-    app.mount() so Starlette never mis-routes scrapes from the Prometheus container.
-    """
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
-
 @app.post("/process", response_model=ProcessResponse)
 async def process_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(description="PDF, DOCX, or PPTX document to analyse."),
     authorization: str | None = Header(default=None),
 ) -> ProcessResponse:
@@ -1121,6 +1208,7 @@ async def process_document(
       7. Open an MLflow run; log parameters, metrics, drift tag, and a text
          artifact containing the summary and questions.
       8. Return the summary, questions, run_id, drift status, and latency.
+      9. Optionally schedule automated_judge_worker (NLI score → MLflow + Thompson).
     """
     _validate_token(authorization)
 
@@ -1269,6 +1357,15 @@ async def process_document(
     # container logs (docker logs ai_doc_backend) without opening MLflow or the UI.
     logger.info("Generated summary (run_id=%s):\n%s", run_id, summary)
 
+    if JUDGE_ENABLED and _judge_ce is not None:
+        background_tasks.add_task(
+            automated_judge_worker,
+            text,
+            summary,
+            selected_model,
+            run_id,
+        )
+
     return ProcessResponse(
         run_id=run_id,
         model_name=selected_model,
@@ -1358,3 +1455,8 @@ async def health() -> dict[str, str]:
     Returns the compute device so operators can confirm GPU/CPU mode at a glance.
     """
     return {"status": "ok", "device": _device}
+
+
+# HTTP traffic metrics (http_requests_total, request latency, etc.) plus the default
+# registry that holds all ai_doc_* custom metrics — single /metrics endpoint.
+Instrumentator().instrument(app).expose(app)
