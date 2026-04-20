@@ -2,9 +2,9 @@
 """
 Build drift_baseline.csv and test_traffic.csv for the 150-request simulator.
 
-Phase A (rows 1 50): CNN-style news (~500 words, moderate FK).
-Phase B (51 100): Billsum legislative text — shifts readability.
-Phase C (101 150): arXiv paper bodies — long, academic drift + Wasserstein.
+Phase A (rows 1-50): CNN-style news (~500 words, moderate FK).
+Phase B (51-100): Billsum legislative text — shifts readability.
+Phase C (101-150): arXiv paper bodies — long, academic drift + Wasserstein.
 
 Requires Hugging Face datasets (first run downloads ~several GB). Set HF_TOKEN if needed.
 """
@@ -16,27 +16,32 @@ import pandas as pd
 from datasets import load_dataset
 
 
+def _load_train_slice(name, config, n_rows, column):
+    """
+    Load the first n_rows examples from split 'train' without streaming.
+
+    HuggingFace ``datasets`` 1.x does not support ``streaming=True`` on
+    ``load_dataset`` (it is forwarded into BuilderConfig and raises). Sliced
+    splits like ``train[:100]`` limit what gets materialized/cached.
+    """
+    slice_split = "train[:%d]" % n_rows
+    if config is None:
+        ds = load_dataset(name, split=slice_split)
+    else:
+        ds = load_dataset(name, config, split=slice_split)
+    # Arrow Dataset: column access returns a Python list of length len(ds).
+    return ds[column]
+
+
 def build_drift_dataset() -> None:
-    print("Loading cnn_dailymail (100 train articles, streaming)...", file=sys.stderr)
-    cnn_stream = load_dataset(
-        "cnn_dailymail",
-        "3.0.0",
-        split="train",
-        streaming=True,
-        trust_remote_code=True,
-    )
-    it_cnn = iter(cnn_stream)
-    cnn_articles = [next(it_cnn)["article"] for _ in range(100)]
+    print("Loading cnn_dailymail (100 train articles)...", file=sys.stderr)
+    cnn_articles = _load_train_slice("cnn_dailymail", "3.0.0", 100, "article")
 
-    print("Loading billsum (50 train rows, streaming)...", file=sys.stderr)
-    bill_stream = load_dataset("billsum", split="train", streaming=True)
-    it_bill = iter(bill_stream)
-    bill_texts = [next(it_bill)["text"] for _ in range(50)]
+    print("Loading billsum (50 train rows)...", file=sys.stderr)
+    bill_texts = _load_train_slice("billsum", None, 50, "text")
 
-    print("Loading scientific_papers arxiv (50 train rows, streaming)...", file=sys.stderr)
-    arx_stream = load_dataset("scientific_papers", "arxiv", split="train", streaming=True)
-    it_arx = iter(arx_stream)
-    arxiv_articles = [next(it_arx)["article"] for _ in range(50)]
+    print("Loading scientific_papers arxiv (50 train rows)...", file=sys.stderr)
+    arxiv_articles = _load_train_slice("scientific_papers", "arxiv", 50, "article")
 
     baseline_df = pd.DataFrame({"text": cnn_articles[:50]})
     out_base = os.environ.get("OUT_BASELINE", "drift_baseline.csv")
