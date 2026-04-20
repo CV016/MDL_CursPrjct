@@ -180,10 +180,14 @@ Verify the monitoring chain on the server:
     curl -s http://localhost:8000/metrics | head     # must show ai_doc_* lines
     Open Prometheus UI -> Status -> Targets -> ai_doc_backend should be STATE=UP
 
-Traffic simulator (150 documents, drift phases — run outside Docker on a machine with disk for HF cache):
+Traffic / batch (run on the server host; not inside a container — needs HF cache for build_drift_dataset):
     cd scripts
     pip install -r requirements.txt
-    python build_drift_dataset.py          # writes drift_baseline.csv and test_traffic.csv
+    python build_drift_dataset.py
     python run_traffic_simulator.py --backend http://localhost:8000 --token <MOCK_JWT_TOKEN>
+
+    Full offline log (JSONL + optional MLflow judge poll — no UI):
+    python run_pipeline_batch.py --backend http://localhost:8000 --token <MOCK_JWT_TOKEN> \
+        --mlflow-uri http://localhost:5000 --output pipeline_results.jsonl
 
 ================================================================================

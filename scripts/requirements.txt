@@ -5,3 +5,6 @@ pandas>=2.0.0,<3.0.0
 datasets>=2.18.0,<3.0.0
 requests>=2.31.0
 tqdm>=4.66.0
+
+# Optional: used only by run_pipeline_batch.py --mlflow-uri to poll judge metrics
+mlflow>=2.13.0,<3.0.0
