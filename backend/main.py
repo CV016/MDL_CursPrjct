@@ -6,7 +6,8 @@ AI-DOC INTERACT — Backend API Service
 This is the single FastAPI application that implements all backend logic for
 the academic MLOps pipeline:
 
-  - Document parsing: PDF via PyPDF2, DOCX via python-docx, PPTX via python-pptx.
+  - Document parsing: plain UTF-8 text (.txt); PDF via PyPDF2; DOCX via python-docx;
+    PPTX via python-pptx.
   - Non-parametric drift detection: word count and Flesch-Kincaid Grade Level
     (computed with textstat) are tested against a hardcoded reference population
     using the Kolmogorov-Smirnov percentile rank and Wasserstein (Earth Mover's)
@@ -423,6 +424,16 @@ def _extract_text_pptx(file_bytes: bytes) -> str:
     return "\n\n".join(slides)
 
 
+def _extract_text_txt(file_bytes: bytes) -> str:
+    """
+    Decode plain text uploaded as UTF-8 bytes.
+
+    Drift simulators (e.g. ``run_pipeline_batch.py``) POST multipart bodies named
+    ``traffic_N.txt``; this path accepts those without PDF/DOCX/PPTX parsing.
+    """
+    return file_bytes.decode("utf-8")
+
+
 def _parse_document(file_bytes: bytes, filename: str) -> str:
     """
     Route a file to the appropriate text extractor based on its extension.
@@ -442,12 +453,20 @@ def _parse_document(file_bytes: bytes, filename: str) -> str:
             return _extract_text_docx(file_bytes)
         elif extension == "pptx":
             return _extract_text_pptx(file_bytes)
+        elif extension == "txt":
+            try:
+                return _extract_text_txt(file_bytes)
+            except UnicodeDecodeError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Plain text uploads must be valid UTF-8.",
+                ) from exc
         else:
             raise HTTPException(
                 status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
                 detail=(
                     f"Unsupported file type '{extension}'. "
-                    "Accepted types: pdf, docx, pptx."
+                    "Accepted types: pdf, docx, pptx, txt."
                 ),
             )
     except HTTPException:
@@ -1192,7 +1211,9 @@ class FeedbackResponse(BaseModel):
 @app.post("/process", response_model=ProcessResponse)
 async def process_document(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(description="PDF, DOCX, or PPTX document to analyse."),
+    file: UploadFile = File(
+        description="PDF, DOCX, PPTX, or UTF-8 plain text (.txt) document to analyse.",
+    ),
     authorization: str | None = Header(default=None),
 ) -> ProcessResponse:
     """
@@ -1200,7 +1221,7 @@ async def process_document(
 
     Steps:
       1. Validate the Bearer token.
-      2. Extract text from the uploaded file (PDF / DOCX / PPTX).
+      2. Extract text from the uploaded file (PDF / DOCX / PPTX / UTF-8 .txt).
       3. Run non-parametric drift detection on word count and readability grade.
       4. Select a model via Thompson Sampling.
       5. Generate a summary (BART or FLAN-T5 depending on the selected model).
