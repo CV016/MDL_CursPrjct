@@ -98,8 +98,8 @@ def _load_news_phase(n_rows):
 def build_drift_dataset() -> None:
     news_articles = _load_news_phase(100)
 
-    print("Loading billsum (50 train rows)...", file=sys.stderr)
-    bill_texts = _load_train_slice("billsum", None, 50, "text")
+    print("Loading xsum (50 train rows)...", file=sys.stderr)
+    bill_texts = _load_train_slice("xsum", None, 50, "document")
 
     print("Loading scientific_papers arxiv (50 train rows)...", file=sys.stderr)
     arxiv_articles = _load_train_slice("scientific_papers", "arxiv", 50, "article")
