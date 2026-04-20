@@ -2,14 +2,12 @@
 """
 Build drift_baseline.csv and test_traffic.csv for the 150-request simulator.
 
-Phase A (rows 1–50): CNN-style news (~500 words, moderate FK).
-Phase B (51–100): Billsum legislative text — shifts readability.
-Phase C (101–150): arXiv paper bodies — long, academic drift + Wasserstein.
+Phase A (rows 1 50): CNN-style news (~500 words, moderate FK).
+Phase B (51 100): Billsum legislative text — shifts readability.
+Phase C (101 150): arXiv paper bodies — long, academic drift + Wasserstein.
 
 Requires Hugging Face datasets (first run downloads ~several GB). Set HF_TOKEN if needed.
 """
-
-from __future__ import annotations
 
 import os
 import sys
@@ -45,7 +43,7 @@ def build_drift_dataset() -> None:
     baseline_df.to_csv(out_base, index=False)
     print(f"Wrote {out_base} ({len(baseline_df)} rows).", file=sys.stderr)
 
-    live_traffic: list[str] = []
+    live_traffic = []
     live_traffic.extend(cnn_articles[50:100])
     live_traffic.extend(bill_texts)
     live_traffic.extend(arxiv_articles)

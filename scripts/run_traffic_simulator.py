@@ -5,8 +5,6 @@ Sequentially POST each row from test_traffic.csv to POST /process (multipart fil
 Use after build_drift_dataset.py. Point BACKEND_URL and MOCK_JWT_TOKEN at your deployment.
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 import sys

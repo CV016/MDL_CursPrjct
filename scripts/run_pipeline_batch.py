@@ -14,21 +14,19 @@ Run on the server with --backend http://localhost:8000 and
 --mlflow-uri http://localhost:5000 (host ports mapped from compose).
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import os
 import sys
 import time
-from typing import Any
+from typing import Any, Dict
 
 import pandas as pd
 import requests
 from tqdm import tqdm
 
 
-def _poll_automated_metrics(run_id: str, tracking_uri: str, max_wait_s: float) -> dict[str, Any]:
+def _poll_automated_metrics(run_id: str, tracking_uri: str, max_wait_s: float) -> Dict[str, Any]:
     """Block until MLflow shows judge metrics for run_id or timeout."""
     try:
         import mlflow
@@ -111,7 +109,7 @@ def main() -> None:
             order = row["upload_order"] if "upload_order" in df.columns else idx + 1
             name = f"traffic_{int(order)}.txt"
             files = {"file": (name, text.encode("utf-8"), "text/plain; charset=utf-8")}
-            record: dict[str, Any] = {
+            record = {
                 "upload_order": int(order),
                 "ok": False,
             }
