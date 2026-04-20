@@ -671,6 +671,49 @@ def _select_model() -> str:
     return chosen
 
 
+import subprocess
+import threading
+
+_is_finetuning: bool = False
+_finetuning_lock: threading.Lock = threading.Lock()
+
+def _run_finetuning_and_reload(model: str, alpha: int, beta: int):
+    global _is_finetuning
+    try:
+        logger.info("Starting background finetuning for model '%s'...", model)
+        process = subprocess.run(
+            ["python", "scripts/finetune_bart.py", "scripts/test_traffic.csv", str(alpha), str(beta)],
+            capture_output=True,
+            text=True
+        )
+        if process.returncode != 0:
+            logger.error("Finetuning failed: %s", process.stderr)
+            return
+
+        distilled_path = "/hf_cache/bart_distilled_final"
+        logger.info("Finetuning complete. Reloading model '%s' from '%s'...", model, distilled_path)
+        _models[model] = pipeline("summarization", model=distilled_path, device=_device_idx)
+        
+        with _thompson_lock:
+            _thompson_state[model]["alpha"] = 1
+            _thompson_state[model]["beta"] = 1
+        logger.info("Model '%s' reloaded successfully. Thompson state reset.", model)
+    except Exception as exc:
+        logger.exception("Error during finetuning/reloading for model '%s': %s", model, exc)
+    finally:
+        with _finetuning_lock:
+            _is_finetuning = False
+
+def _trigger_finetuning_if_needed(model: str, alpha: int, beta: int):
+    global _is_finetuning
+    total = alpha + beta
+    if total >= 10 and (beta / total) > 0.7:
+        if model == "bart":
+            with _finetuning_lock:
+                if not _is_finetuning:
+                    _is_finetuning = True
+                    threading.Thread(target=_run_finetuning_and_reload, args=(model, alpha, beta), daemon=True).start()
+
 def _update_thompson(model: str, thumbs_up: bool) -> None:
     """
     Apply one feedback observation to the model's Beta posterior.
@@ -697,6 +740,8 @@ def _update_thompson(model: str, thumbs_up: bool) -> None:
         new_alpha,
         new_beta,
     )
+
+    _trigger_finetuning_if_needed(model, new_alpha, new_beta)
 
 
 def _entailment_score(premise: str, hypothesis: str) -> float:

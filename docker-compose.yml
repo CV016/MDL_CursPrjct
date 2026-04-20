@@ -105,6 +105,8 @@ services:
       # Change the left side to a path on /data if your admin recommends it,
       # e.g.:  /data/${USER}/hf_cache:/hf_cache
       - ./hf_cache:/hf_cache
+      # Mount scripts directory into the container to enable finetune task
+      - ./scripts:/app/scripts
     # GPU access — requests one NVIDIA GPU from the host via Container Toolkit.
     # Remove this entire deploy block if you want to force CPU-only mode.
     deploy:

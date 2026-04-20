@@ -46,3 +46,7 @@ prometheus-fastapi-instrumentator==7.0.0
 
 # NLI cross-encoder for automated summary quality judging (CPU to avoid GPU RAM contention)
 sentence-transformers==3.0.1
+
+datasets==2.19.2
+pandas==2.2.2
+
