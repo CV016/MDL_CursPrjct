@@ -46,7 +46,7 @@ def _load_train_slice(name, config, n_rows, column):
     slice_split = "train[:%d]" % n_rows
 
     def _invoke(download_mode=None):
-        kw = {}
+        kw = {"ignore_verifications": True}   # <-- add this
         if download_mode is not None:
             kw["download_mode"] = download_mode
         if config is None:
