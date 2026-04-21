@@ -16,14 +16,18 @@ STEP 1 — Connect to the server with port forwarding
 Run this command in your local terminal (Windows PowerShell or Mac/Linux shell).
 Keep this terminal open the entire time you are using the app.
 
-    ssh -L 9501:localhost:9501 -L 8000:localhost:8000 -L 5000:localhost:5000 -L 9090:localhost:9090 -L 3000:localhost:3000 b22bb016@172.25.1.12
+    ssh -L 9501:localhost:9501 -L 8000:localhost:8000 -L 5000:localhost:5000 -L 9090:localhost:9090 -L 3001:localhost:3001 b22bb016@172.25.1.12
 
 What this does:
     localhost:9501  ->  Streamlit UI
     localhost:8000  ->  FastAPI backend  (Swagger docs at /docs)
     localhost:5000  ->  MLflow UI
     localhost:9090  ->  Prometheus UI
-    localhost:3000  ->  Grafana dashboard  (login: admin / admin)
+    localhost:3001  ->  Grafana dashboard  (login: admin / admin)
+
+Important: Grafana is published on the server host as port 3001 (see docker-compose:
+    "3001:3000").  The tunnel must forward remote localhost:3001, not :3000, or the
+    SSH client will report "Connection refused" for those channels.
 
 Once connected you are inside the server. All commands below are run there.
 
@@ -87,7 +91,7 @@ With the SSH tunnel from Step 1 still open, visit:
     MLflow UI      ->  http://localhost:5000
     API docs       ->  http://localhost:8000/docs
     Prometheus     ->  http://localhost:9090
-    Grafana        ->  http://localhost:3000  (login: admin / admin)
+    Grafana        ->  http://localhost:3001  (login: admin / admin)
 
 The backend takes about 2 minutes to load both AI models on first start.
 If the UI shows a connection error, wait and refresh.
@@ -160,6 +164,11 @@ Container shows "exited":
     Either the tunnel is not open (re-run Step 1) or the frontend container
     has not started yet. Check:  docker compose ps
 
+"Connection refused" for SSH tunnel channels to Grafana (e.g. channel 13/14):
+    Forward remote port 3001, not 3000. Use  -L 3001:localhost:3001  and open
+    http://localhost:3001 on your laptop.  On the server, Grafana listens on
+    host port 3001 (see docker-compose.yml).
+
 Port already in use:
     Another process on the server is using that port.
     Check which host port is mapped in docker-compose.yml and adjust your
@@ -170,7 +179,16 @@ Git conflict on git pull:
     git fetch origin && git reset --hard origin/newPlan
     This discards all local server changes and takes the remote version.
 
-Grafana shows "No data" but Prometheus works:
+Grafana shows "No data" on rate/latency panels but Prometheus works:
+    Panels that use rate() need time series to exist and at least two Prometheus
+    scrapes for a non-empty rate.  Send some traffic (Streamlit, /process, or
+    run_pipeline_batch.py), set the dashboard time range to include that period
+    (e.g. Last 24 hours), and wait ~30s.  Inference latency and FastAPI HTTP
+    charts stay empty until the first request creates histogram / http metrics.
+    The backend also pre-registers ai_doc_* counters at startup so request/drift/
+    feedback rate panels can show 0 instead of empty after redeploy.
+
+Grafana datasource / uid mismatch:
     The Grafana datasource must use uid=prometheus to match the dashboard.
     If you upgraded from an older compose file, remove Grafana's volume so
     provisioning re-runs:  docker compose down && docker volume rm <project>_grafana_data

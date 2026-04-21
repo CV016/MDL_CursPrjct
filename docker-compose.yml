@@ -6,7 +6,7 @@
 #   backend-api    (port 8000) — FastAPI with both HuggingFace models + GPU
 #   frontend-ui    (port 9501) — Streamlit UI
 #   prometheus     (port 9090) — time-series metrics collector
-#   grafana        (port 3000) — live operational dashboard
+#   grafana        (host port 3001 -> container 3000) — live operational dashboard
 #
 # GPU note:
 #   backend-api requests one NVIDIA GPU via the deploy.resources block.

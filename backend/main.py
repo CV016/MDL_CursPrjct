@@ -235,6 +235,28 @@ DRIFT_WINDOW_GAUGE: Gauge = Gauge(
     "Number of observations currently in the rolling drift window.",
 )
 
+
+def _warmup_prometheus_counters() -> None:
+    """
+    Register common label combinations with value 0 so Prometheus exposes the
+    series before the first /process request.
+
+    Counters only appear in /metrics after at least one .labels().inc() call.
+    Without this, Grafana panels using rate() show 'No data' until traffic
+    arrives (rate() needs a time series to exist).  inc(0) is allowed by
+    prometheus_client and does not change the logical count.
+    """
+    for _model in ("bart", "flan"):
+        REQUEST_COUNT.labels(
+            model_name=_model,
+            file_type="txt",
+            drift_status="normal",
+        ).inc(0)
+        for _outcome in ("thumbs_up", "thumbs_down"):
+            FEEDBACK_COUNTER.labels(model_name=_model, outcome=_outcome).inc(0)
+    DRIFT_COUNTER.labels(drift_status="normal").inc(0)
+
+
 # ---------------------------------------------------------------------------
 # FastAPI application instance
 # ---------------------------------------------------------------------------
@@ -325,6 +347,8 @@ async def on_startup() -> None:
     for _m in ("bart", "flan"):
         THOMPSON_ALPHA.labels(model_name=_m).set(1)
         THOMPSON_BETA.labels(model_name=_m).set(1)
+
+    _warmup_prometheus_counters()
 
     logger.info("Startup complete. Both models are loaded and ready.")
 
